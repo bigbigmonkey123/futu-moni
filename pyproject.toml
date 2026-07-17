@@ -23,4 +23,4 @@ classifiers = [
 futu-moni = "futu_moni:main"
 
 [project.urls]
-Repository = "https://github.com/nicebill/futu-moni"
+Repository = "https://github.com/bigbigmonkey123/futu-moni"
