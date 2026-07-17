@@ -4,6 +4,39 @@ Standalone market data client for [Futu/Moomoo](https://www.futunn.com) using th
 
 Connects directly to Futu quote servers via TCP + Protobuf on port 443, the same protocol the desktop app uses internally.
 
+---
+
+## 中文介绍
+
+把 Futu/Moomoo 桌面客户端的闭源行情通道，变成一个可编程的命令行工具。
+
+### 为什么做
+
+Futu 官方 OpenD API **不支持日本市场数据**，但桌面客户端能看到日股行情——数据通道存在，只是没有开放。futu-moni 的思路：**逆向客户端协议，自己拿数据。**
+
+### 核心技术点
+
+1. **FT 协议逆向** — TCP 443 端口纯明文通信，私有 FT 协议：32 字节大端序 Header + Protobuf Body。关键命令 CMD `0x1AA8`，selector 0 返回实时价格（纳单位 ÷10⁹）
+2. **登录包重放认证** — 登录用 RSA + 随机填充加密，无法从零构造。方案：用 `tcpdump` 抓取客户端登录包，连接时直接重放，User ID 从包头自动提取
+3. **多市场路由** — 同一个查询命令，通过 route 字段区分市场：港股→1，美股→11，日股→1001
+4. **证券 ID 解析** — 协议层使用内部数字 ID，从客户端本地 SQLite 数据库（SecListDB ~79MB）查找，自动按市场优先级去重
+
+### 踩过的坑
+
+- **合并请求只返回第一只** — 多只股票塞一个请求，服务端只返回第一只，改为逐只发送
+- **响应有非标前缀** — Protobuf 数据前有 4-6 字节自定义头，搜索 varint 标记定位数据起始位置
+- **单位不统一** — 指数推送用毫单位（÷1000），个股查询用纳单位（÷10⁹），混用差 6 个数量级
+
+### 项目特点
+
+- 零依赖，纯 Python 标准库
+- 单文件，一个 `.py` 搞定
+- 港股 / 美股 / 日股统一接口
+- 主动查询，按需获取实时数据
+- 完全脱敏开源
+
+---
+
 ## Supported Markets
 
 | Market | Route | Examples |
