@@ -1,7 +1,6 @@
 """One-command entry point: sudo python3 -m futu_moni
 
-Runs all pre-flight checks, sets up the MITM proxy, launches FTNN,
-queries JP ETF quotes, prints results, and cleans up.
+Single-phase: preload IP pool, route+PF anchor, launch FTNN, intercept LOGIN, query quotes.
 """
 
 from __future__ import annotations
@@ -9,9 +8,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import signal
-import socket
-import subprocess
 import sys
 from pathlib import Path
 
@@ -24,26 +20,6 @@ def _preflight() -> list[str]:
 
     if os.geteuid() != 0:
         issues.append("需要 root 权限: 请用 sudo python3 -m futu_moni 运行")
-
-    try:
-        result = socket.getaddrinfo("nnproxy.futunn.com", 443, socket.AF_INET, socket.SOCK_STREAM)
-        if not result:
-            issues.append("DNS 解析失败: nnproxy.futunn.com 无法解析")
-    except socket.gaierror:
-        issues.append("DNS 解析失败: nnproxy.futunn.com 无法解析")
-
-    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        probe.bind(("127.0.0.1", 443))
-        probe.close()
-    except OSError:
-        probe.close()
-        issues.append("端口 443 被占用: 请先释放 (lsof -nP -iTCP:443 -sTCP:LISTEN)")
-
-    result = subprocess.run(["pgrep", "-x", "FTNN"], capture_output=True)
-    if result.returncode == 0:
-        pid = result.stdout.decode().strip()
-        issues.append(f"富途牛牛已在运行 (PID {pid}): 请先退出 FTNN 再启动")
 
     seclist_paths = [
         Path.home() / ".com.futunn.FutuOpenD/F3CNN/SecListDB.v13.dat",
@@ -93,19 +69,16 @@ def main() -> None:
 
     config = ProxyConfig()
 
-    print(f"[代理] 解析服务器域名 nnproxy.futunn.com ...")
-    print(f"[代理] 修改 /etc/hosts → 127.0.0.1")
-    print(f"[代理] 启动 FTNN 并等待登录 (最多 {int(config.login_timeout_seconds)} 秒)...")
-    print()
-    print("  ➜ 请在弹出的富途牛牛窗口中正常登录")
+    print("[启动] 预加载 IP 池, 设置路由拦截, 启动 FTNN...")
+    print("  ➜ 如果弹出登录窗口, 请正常登录")
     print()
 
     session = obtain_authenticated_session(config)
 
     if session is None:
         print()
-        print("❌ 登录超时或失败")
-        print("   可能原因: FTNN 没有成功连接到代理")
+        print("❌ 登录超时或未发现服务器")
+        print("   可能原因: FTNN 没有成功连接或自动登录失败")
         sys.exit(1)
 
     print(f"[代理] 登录成功 ✓")

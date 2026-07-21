@@ -44,39 +44,9 @@ VPYTHON="$VENV/bin/python"
 
 # ── 3. 检查是否需要 sudo ────────────────────────────────
 if [ "$(id -u)" -ne 0 ]; then
-    echo "需要 root 权限 (修改 /etc/hosts + 绑定端口 443)"
+    echo "需要 root 权限 (route/pfctl + lsof)"
     exec sudo "$VPYTHON" -m futu_moni "$@"
 fi
 
 # ── 4. 已是 root, 直接运行 ──────────────────────────────
-if [ "$1" = "serve" ]; then
-    POLL="${2:-300}"
-    exec "$VPYTHON" -c "
-import logging, signal
-from futu_moni import FutuNativeService, ServiceConfig, ProxyConfig
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
-print('持续服务模式: 每 ${POLL} 秒查询一次 (Ctrl+C 退出)')
-print()
-
-config = ServiceConfig(
-    use_proxy=True,
-    proxy=ProxyConfig(),
-    poll_interval_seconds=${POLL},
-)
-
-def on_report(report, health):
-    success = [q for q in report.quotes if q.status.value == 'success']
-    for q in success:
-        print(f'  {q.symbol}: last={q.last} prev_close={q.prev_close}')
-    print(f'  decision={report.decision.value} ({len(success)}/3)')
-    print()
-
-service = FutuNativeService(config, on_report=on_report)
-signal.signal(signal.SIGINT, lambda *_: service.stop())
-signal.signal(signal.SIGTERM, lambda *_: service.stop())
-service.run()
-"
-else
-    exec "$VPYTHON" -m futu_moni
-fi
+exec "$VPYTHON" -m futu_moni "$@"

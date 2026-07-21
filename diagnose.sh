@@ -73,7 +73,7 @@ CONN_LOG="/tmp/ftnn-conn-$$.log"
 for i in $(seq 1 60); do
     # 采集所有 FTNN 相关进程的连接
     for pid in $(pgrep -f "FTNN|FutuOpenD|FTGateway" 2>/dev/null); do
-        lsof -nP -iTCP -p "$pid" 2>/dev/null | grep -E 'ESTABLISHED|SYN_SENT' >> "$CONN_LOG"
+        lsof -nP -a -p "$pid" -iTCP 2>/dev/null | grep -E 'ESTABLISHED|SYN_SENT' >> "$CONN_LOG"
     done
     printf "\r  采集中... %d/60s" "$i"
     sleep 1
@@ -101,7 +101,7 @@ echo | tee -a "$REPORT"
 
 # TCP 连接 (去重, 只看远端 IP:port)
 echo "── FTNN TCP 连接 (去重) ──" | tee -a "$REPORT"
-awk '{print $9}' "$CONN_LOG" 2>/dev/null | grep '->' | sed 's/.*->//' | sort -u | tee -a "$REPORT"
+awk '{print $9}' "$CONN_LOG" 2>/dev/null | grep -- '->' | sed 's/.*->//' | sort -u | tee -a "$REPORT"
 if [ ! -s "$CONN_LOG" ]; then
     echo "  (无 TCP 连接)" | tee -a "$REPORT"
 fi
@@ -109,7 +109,7 @@ echo | tee -a "$REPORT"
 
 # 443 端口连接 (最重要)
 echo "── 端口 443 连接 (可能是 FT 协议) ──" | tee -a "$REPORT"
-awk '{print $9}' "$CONN_LOG" 2>/dev/null | grep '->' | sed 's/.*->//' | grep ':443$' | sort -u | tee -a "$REPORT"
+awk '{print $9}' "$CONN_LOG" 2>/dev/null | grep -- '->' | sed 's/.*->//' | grep ':443$' | sort -u | tee -a "$REPORT"
 if ! awk '{print $9}' "$CONN_LOG" 2>/dev/null | grep -q ':443$'; then
     echo "  (无 443 端口连接)" | tee -a "$REPORT"
 fi
@@ -117,7 +117,7 @@ echo | tee -a "$REPORT"
 
 # 反查 443 端口 IP 的域名
 echo "── 443 端口 IP 反查 ──" | tee -a "$REPORT"
-for ip in $(awk '{print $9}' "$CONN_LOG" 2>/dev/null | grep '->' | sed 's/.*->//' | grep ':443$' | sed 's/:443$//' | sort -u); do
+for ip in $(awk '{print $9}' "$CONN_LOG" 2>/dev/null | grep -- '->' | sed 's/.*->//' | grep ':443$' | sed 's/:443$//' | sort -u); do
     rev=$(host "$ip" 2>/dev/null | head -1)
     # 正向查 nnproxy
     match=""

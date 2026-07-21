@@ -14,34 +14,42 @@ cd futu-moni
 ./run.sh
 ```
 
-脚本会自动：创建虚拟环境 → 安装依赖 → 申请 sudo → 启动代理 → 打开富途牛牛
+脚本会自动：创建虚拟环境 → 安装依赖 → 申请 sudo → 发现服务器 → 拦截登录 → 查询报价
 
-**你只需要在弹出的富途牛牛窗口中登录**，登录后自动查询报价并输出结果。
+**首次使用需在弹出的富途牛牛窗口中登录**，之后自动登录无需操作。
 
-### 持续服务模式
+## 原理
 
-```bash
-./run.sh serve        # 每 5 分钟查一次
-./run.sh serve 120    # 每 2 分钟查一次
+```
+阶段 1 — 发现:
+  启动 FTNN → lsof 采集所有 port 443 连接 → 记录 IP → 关闭 FTNN
+
+阶段 2 — 拦截:
+  route add IP → lo0  ─┐
+  pfctl rdr :443 → :19443 ─┤
+  启动代理 (:19443)        │
+  重启 FTNN (自动登录)  ────┘ → FTNN ──→ lo0 ──→ PF ──→ 代理 ──→ 真实服务器
+  登录成功后: 清除 route/PF, 在连接上查询报价
 ```
 
-### 通过 pip 安装
-
-```bash
-pip install git+https://github.com/bigbigmonkey123/futu-moni.git
-sudo futu-moni
-```
+FTNN 的 FT 协议服务器 IP 是动态分配的（通过 API 获取，不走 DNS），
+所以必须先让 FTNN 连一次来发现 IP，再路由拦截。
 
 ## 输出示例
 
 ```
-[代理] 解析服务器域名 nnproxy.futunn.com ...
-[代理] 修改 /etc/hosts → 127.0.0.1
-[代理] 启动 FTNN 并等待登录 (最多 120 秒)...
+============================================================
+futu-moni: JP ETF 报价服务 (1306 / 1321 / 1489)
+============================================================
 
-  ➜ 请在弹出的富途牛牛窗口中正常登录
+[阶段1] 启动 FTNN 发现服务器 IP...
+  discovered: 43.153.233.15
+  discovered: 43.153.233.166
+  discovered: 47.242.25.150
 
-[代理] 登录成功 ✓
+[阶段2] 3 IPs routed, forward=43.153.233.15, proxy=:19443
+  FTNN relaunched, waiting for auto-login...
+  LOGIN success ✓
 
 [查询] 正在获取报价...
 
@@ -55,39 +63,27 @@ sudo futu-moni
 ============================================================
 ```
 
-## 原理
-
-```
-1. 解析 nnproxy.futunn.com 得到真实服务器 IP
-2. 临时修改 /etc/hosts → 127.0.0.1
-3. 启动代理 (127.0.0.1:443) + 打开富途牛牛
-4. 富途牛牛登录流量 → 本地代理 → 真实服务器
-5. 登录成功后: 恢复 /etc/hosts, 在连接上查询报价
-```
-
-FT 协议使用一次性登录 token，无法抓包重放。本项目让 FTNN 自己完成认证，然后"借用"认证后的连接查询报价。
-
 ## 常见问题
 
-**端口 443 被占用**
-```bash
-sudo lsof -nP -iTCP:443 -sTCP:LISTEN
-# 关掉占用 443 的程序, 再运行 ./run.sh
-```
+**FTNN 自动登录失败**
+首次使用必须手动登录。登录时勾选"自动登录"，之后的查询不需要手动操作。
 
-**异常退出后 /etc/hosts 残留**
-```bash
-sudo sed -i '' '/futu-moni-proxy/d' /etc/hosts
-```
+**Phase 1 没发现任何 IP**
+- FTNN 可能被防火墙阻止
+- 检查网络连接
+- 增加发现时间: `ProxyConfig(discovery_seconds=60)`
 
-**DNS 解析的服务器拒绝登录**
+**Phase 2 超时**
+- FTNN 自动登录 token 可能已过期，需要手动重新登录
+- 确认没有其他 PF 规则冲突: `sudo pfctl -sr`
+
+**异常退出后路由残留**
 ```bash
-# 手动指定已知可用的服务器 IP
-sudo .venv/bin/python -c "
-from futu_moni import FutuNativeService, ServiceConfig, ProxyConfig
-config = ServiceConfig(use_proxy=True, proxy=ProxyConfig(forward_server='119.28.37.206'))
-FutuNativeService(config, on_report=lambda r,h: print(r.model_dump_json())).run()
-"
+# 查看残留路由
+netstat -rn | grep lo0 | grep "43\.\|47\.\|49\."
+# 手动清除
+sudo route delete -host <IP>
+sudo pfctl -d
 ```
 
 ## 目标证券
@@ -101,9 +97,9 @@ FutuNativeService(config, on_report=lambda r,h: print(r.model_dump_json())).run(
 ## 已知限制
 
 - macOS only
-- 需要 root 权限 (/etc/hosts + 端口 443)
-- FTNN 崩溃后需手动重启
-- 需要在 FTNN 窗口中手动登录 (有自动登录则无需操作)
+- 需要 root 权限 (route/pfctl + lsof)
+- 需要 FTNN 开启自动登录才能全自动
+- FTNN 崩溃后需重新运行
 
 ## License
 

@@ -1,21 +1,28 @@
-"""Hosts-based MITM proxy for intercepting FTNN's FT protocol login.
+"""Single-phase MITM proxy for intercepting FTNN's FT protocol login.
 
-Temporarily redirects FTNN's server domains to localhost via /etc/hosts,
-captures the authenticated TCP socket when FTNN logs in, then restores
-DNS and injects QUOTE queries on the hijacked connection.
+Preloads candidate IPs from F3CLogin.framework (hardcoded) and
+CommonConfig.db (guaranteed_ip_for_conn), routes ALL to lo0, PF-anchor
+redirects port 443 → local proxy.  Launches FTNN once (no kill/restart
+discovery cycle).  lsof live-monitors for ConnIpRsp dynamic IPs.
 
-Requires root privileges for /etc/hosts and binding port 443.
+Requires root privileges for route/pfctl and lsof.
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import re
 import select
 import socket
 import struct
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
+from ipaddress import IPv4Address
+from pathlib import Path
 
 from futu_moni.protocol import (
     CMD_LOGIN,
@@ -27,17 +34,25 @@ from futu_moni.protocol import (
 
 logger = logging.getLogger(__name__)
 
-FUTU_PROXY_DOMAINS = ("nnproxy.futunn.com", "nnproxy2.futunn.com")
-HOSTS_MARKER = "# futu-moni-proxy"
-HOSTS_PATH = "/etc/hosts"
+PROXY_PORT = 19443
+PF_ANCHOR = "stock-moni"
+_IP_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+
+F3CLOGIN_PATH = (
+    "/Applications/富途牛牛.app/Contents/Frameworks/F3CLogin.framework/F3CLogin"
+)
+COMMONCONFIG_DB_PATH = (
+    "~/Library/Containers/cn.futu.niuniu.nx/Data/Library/"
+    "Application Support/Common/CommonConfig.db"
+)
 
 
 @dataclass
 class ProxyConfig:
     forward_server: str = ""
     forward_port: int = 443
+    proxy_port: int = PROXY_PORT
     login_timeout_seconds: float = 120.0
-    domains: tuple[str, ...] = FUTU_PROXY_DOMAINS
 
 
 @dataclass
@@ -46,88 +61,147 @@ class ProxySession:
     user_id: int
 
 
-def _resolve_forward_server(domains: tuple[str, ...], port: int) -> str:
-    """Resolve real server IP from DNS before we modify /etc/hosts."""
-    for domain in domains:
-        try:
-            results = socket.getaddrinfo(domain, port, socket.AF_INET, socket.SOCK_STREAM)
-            if results:
-                ip = results[0][4][0]
-                logger.info("resolved %s -> %s", domain, ip)
-                return ip
-        except socket.gaierror:
-            continue
-    raise RuntimeError(f"cannot resolve any of {domains}")
+def _is_public_ip(ip_str: str) -> bool:
+    try:
+        return IPv4Address(ip_str).is_global
+    except ValueError:
+        return False
 
 
-def _flush_dns() -> None:
-    subprocess.run(["dscacheutil", "-flushcache"], capture_output=True)
-    subprocess.run(["killall", "-HUP", "mDNSResponder"], capture_output=True)
+# ── IP Pool Loading ───────────────────────────────────────
 
 
-def _ft_frame(data: bytes | bytearray, offset: int = 0):
-    if len(data) - offset < HEADER_LENGTH:
-        return None, offset
-    if data[offset:offset + 2] != b"FT" or data[offset + 2] != 0x27:
-        return None, offset
-    body_len = struct.unpack(">I", data[offset + 18:offset + 22])[0]
-    if body_len > MAX_BODY_LENGTH:
-        return None, offset
-    total = HEADER_LENGTH + body_len
-    if len(data) - offset < total:
-        return None, offset
-    cmd = struct.unpack(">H", data[offset + 16:offset + 18])[0]
-    ext = struct.unpack(">H", data[offset + 30:offset + 32])[0]
-    return (cmd, bytes(data[offset:offset + total]), ext), offset + total
+def _load_f3clogin_ips(binary_path: str = F3CLOGIN_PATH) -> set[str]:
+    if not Path(binary_path).exists():
+        logger.warning("F3CLogin binary not found: %s", binary_path)
+        return set()
+    result = subprocess.run(
+        ["strings", binary_path], capture_output=True, text=True, timeout=30,
+    )
+    ips = {m.group(1) for m in _IP_RE.finditer(result.stdout) if _is_public_ip(m.group(1))}
+    logger.info("loaded %d public IPs from F3CLogin binary", len(ips))
+    return ips
+
+
+def _load_guaranteed_ips(db_path: str = COMMONCONFIG_DB_PATH) -> set[str]:
+    expanded = Path(db_path).expanduser()
+    if not expanded.exists():
+        logger.warning("CommonConfig.db not found: %s", expanded)
+        return set()
+    result = subprocess.run(
+        [
+            "sqlite3", str(expanded),
+            "SELECT conf_value FROM commonConfigTb WHERE conf_name='guaranteed_ip_for_conn'",
+        ],
+        capture_output=True, text=True, timeout=10,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return set()
+    try:
+        entries = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return set()
+    ips: set[str] = set()
+    for entry in entries:
+        for ip in entry.get("ip", []):
+            if _is_public_ip(ip):
+                ips.add(ip)
+    logger.info("loaded %d IPs from guaranteed_ip_for_conn", len(ips))
+    return ips
+
+
+def load_ip_pool() -> set[str]:
+    pool = _load_f3clogin_ips() | _load_guaranteed_ips()
+    logger.info("total IP pool: %d candidates", len(pool))
+    return pool
+
+
+# ── Proxy Bridge ──────────────────────────────────────────
 
 
 class _ProxyBridge:
-    """Manages /etc/hosts redirect and proxy listener for one login cycle."""
-
-    def __init__(self, config: ProxyConfig) -> None:
+    def __init__(self, config: ProxyConfig, ip_pool: set[str]) -> None:
         self.config = config
         self._stop = threading.Event()
         self._login_done = threading.Event()
         self._session: ProxySession | None = None
         self._lock = threading.Lock()
+        self._routes: list[str] = []
+        self._pf_anchor_active = False
+        self._ip_pool = set(ip_pool)
+        self._trap_ips = sorted(self._ip_pool)
+        self._fallback_ip = config.forward_server or self._trap_ips[0]
 
-        if config.forward_server:
-            self._forward_ip = config.forward_server
-        else:
-            self._forward_ip = _resolve_forward_server(
-                config.domains, config.forward_port,
+    def _setup_routes(self) -> None:
+        for ip in self._trap_ips:
+            result = subprocess.run(
+                ["route", "add", "-host", ip, "-interface", "lo0"],
+                capture_output=True, text=True,
             )
+            if result.returncode == 0:
+                self._routes.append(ip)
+            else:
+                logger.warning("route add %s failed: %s", ip, result.stderr.strip())
 
-    def _setup_hosts(self) -> None:
-        domains_str = " ".join(self.config.domains)
-        entry = f"127.0.0.1 {domains_str} {HOSTS_MARKER}\n"
-        with open(HOSTS_PATH, "r") as f:
-            lines = f.readlines()
-        lines = [l for l in lines if HOSTS_MARKER not in l]
-        lines.append(entry)
-        with open(HOSTS_PATH, "w") as f:
-            f.writelines(lines)
-        _flush_dns()
-        logger.info("hosts: redirected %s -> 127.0.0.1", ", ".join(self.config.domains))
+    def _hot_add_route(self, ip: str) -> bool:
+        if ip in self._ip_pool or not _is_public_ip(ip):
+            return False
+        result = subprocess.run(
+            ["route", "add", "-host", ip, "-interface", "lo0"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            self._ip_pool.add(ip)
+            self._routes.append(ip)
+            logger.info("hot-added route for ConnIpRsp IP: %s", ip)
+            return True
+        return False
 
-    def _cleanup_hosts(self) -> None:
+    def _setup_pf_anchor(self) -> None:
+        rule = (
+            f"rdr pass on lo0 proto tcp from any to any port 443 "
+            f"-> 127.0.0.1 port {self.config.proxy_port}\n"
+        )
+        subprocess.run(
+            ["pfctl", "-a", PF_ANCHOR, "-f", "-"],
+            input=rule, capture_output=True, text=True,
+        )
+        subprocess.run(["pfctl", "-e"], capture_output=True, text=True)
+        self._pf_anchor_active = True
+
+    def _cleanup(self) -> None:
+        for ip in reversed(self._routes):
+            subprocess.run(["route", "delete", "-host", ip], capture_output=True)
+        self._routes.clear()
+        if self._pf_anchor_active:
+            subprocess.run(
+                ["pfctl", "-a", PF_ANCHOR, "-F", "all"],
+                capture_output=True, text=True,
+            )
+            self._pf_anchor_active = False
+
+    def _resolve_original_dst(self, client_sock: socket.socket) -> str:
         try:
-            with open(HOSTS_PATH, "r") as f:
-                lines = f.readlines()
-            clean = [l for l in lines if HOSTS_MARKER not in l]
-            if len(clean) != len(lines):
-                with open(HOSTS_PATH, "w") as f:
-                    f.writelines(clean)
-                _flush_dns()
-                logger.info("hosts: restored")
-        except OSError:
+            peer = client_sock.getpeername()
+            result = subprocess.run(
+                ["pfctl", "-s", "state"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                if str(peer[1]) in line and "443" in line:
+                    for m in _IP_RE.finditer(line):
+                        ip = m.group(1)
+                        if ip in self._ip_pool:
+                            return ip
+        except Exception:
             pass
+        return self._fallback_ip
 
     def _handle_connection(self, csock: socket.socket) -> None:
+        forward_ip = self._resolve_original_dst(csock)
         try:
             rsock = socket.create_connection(
-                (self._forward_ip, self.config.forward_port),
-                timeout=10,
+                (forward_ip, self.config.forward_port), timeout=10,
             )
         except OSError:
             csock.close()
@@ -135,6 +209,8 @@ class _ProxyBridge:
 
         uid = None
         logged = False
+        buf_c = bytearray()
+        buf_r = bytearray()
 
         try:
             while not self._stop.is_set():
@@ -144,32 +220,44 @@ class _ProxyBridge:
                         d = csock.recv(65536)
                         if not d:
                             return
-                        buf = bytearray(d)
-                        off = 0
-                        while off < len(buf):
-                            res, noff = _ft_frame(buf, off)
-                            if not res:
+                        buf_c.extend(d)
+                        while True:
+                            if len(buf_c) < HEADER_LENGTH:
                                 break
-                            cmd, fb, ext = res
-                            off = noff
+                            if buf_c[:2] != b"FT":
+                                break
+                            bl = struct.unpack(">I", buf_c[18:22])[0]
+                            if bl > MAX_BODY_LENGTH:
+                                break
+                            total = HEADER_LENGTH + bl
+                            if len(buf_c) < total:
+                                break
+                            cmd = struct.unpack(">H", buf_c[16:18])[0]
                             if cmd == CMD_LOGIN:
-                                uid = struct.unpack(">I", fb[8:12])[0] >> 8
-                                logger.debug("proxy: LOGIN detected user=***%s", str(uid)[-3:])
+                                uid = struct.unpack(">I", buf_c[8:12])[0] >> 8
+                                logger.debug("proxy: LOGIN detected")
+                            del buf_c[:total]
                         rsock.sendall(d)
                     elif s is rsock:
                         d = rsock.recv(65536)
                         if not d:
                             return
-                        buf = bytearray(d)
-                        off = 0
-                        while off < len(buf):
-                            res, noff = _ft_frame(buf, off)
-                            if not res:
+                        buf_r.extend(d)
+                        while True:
+                            if len(buf_r) < HEADER_LENGTH:
                                 break
-                            cmd, fb, ext = res
-                            off = noff
+                            if buf_r[:2] != b"FT":
+                                break
+                            bl = struct.unpack(">I", buf_r[18:22])[0]
+                            ext = struct.unpack(">H", buf_r[30:32])[0]
+                            if bl > MAX_BODY_LENGTH:
+                                break
+                            total = HEADER_LENGTH + bl
+                            if len(buf_r) < total:
+                                break
+                            cmd = struct.unpack(">H", buf_r[16:18])[0]
                             if cmd == CMD_LOGIN and uid:
-                                payload = fb[HEADER_LENGTH + ext:]
+                                payload = bytes(buf_r[HEADER_LENGTH + ext:total])
                                 if len(payload) >= 2:
                                     _, p = decode_varint(payload, 0)
                                     rv, _ = decode_varint(payload, p)
@@ -181,6 +269,7 @@ class _ProxyBridge:
                                         self._login_done.set()
                                     else:
                                         logger.warning("proxy: LOGIN rejected (0x%x)", rv)
+                            del buf_r[:total]
                         csock.sendall(d)
                         if logged:
                             csock.close()
@@ -192,13 +281,37 @@ class _ProxyBridge:
             if not logged:
                 rsock.close()
 
+    def _lsof_monitor(self) -> None:
+        while not self._stop.is_set():
+            try:
+                result = subprocess.run(
+                    ["lsof", "-nP", "-iTCP:443", "-sTCP:ESTABLISHED,SYN_SENT"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                for line in result.stdout.splitlines():
+                    if "FTNN" not in line and "FutuOpenD" not in line:
+                        continue
+                    for part in line.split():
+                        if "->" in part:
+                            remote = part.split("->")[-1]
+                            if remote.endswith(":443"):
+                                ip = remote.rsplit(":", 1)[0]
+                                self._hot_add_route(ip)
+            except Exception:
+                pass
+            self._stop.wait(3)
+
     def intercept_login(self) -> ProxySession | None:
-        """Set up hosts redirect, launch FTNN, wait for login."""
-        self._setup_hosts()
+        self._setup_routes()
+        self._setup_pf_anchor()
+        logger.info(
+            "proxy: %d IPs routed, PF anchor=%s, proxy=:%d",
+            len(self._routes), PF_ANCHOR, self.config.proxy_port,
+        )
 
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", self.config.forward_port))
+        srv.bind(("127.0.0.1", self.config.proxy_port))
         srv.listen(20)
         srv.settimeout(2.0)
 
@@ -215,27 +328,35 @@ class _ProxyBridge:
 
         accept_thread = threading.Thread(target=accept_loop, daemon=True)
         accept_thread.start()
+        monitor_thread = threading.Thread(target=self._lsof_monitor, daemon=True)
+        monitor_thread.start()
 
+        subprocess.run(["killall", "FTNN"], capture_output=True)
+        time.sleep(1)
         subprocess.Popen(["open", "/Applications/富途牛牛.app"])
-        logger.info("proxy: FTNN launched, waiting for login...")
+        logger.info("FTNN launched, waiting for auto-login...")
 
         self._login_done.wait(timeout=self.config.login_timeout_seconds)
         self._stop.set()
-
-        self._cleanup_hosts()
+        self._cleanup()
 
         with self._lock:
             return self._session
 
     def cleanup(self) -> None:
         self._stop.set()
-        self._cleanup_hosts()
+        self._cleanup()
 
 
 def obtain_authenticated_session(config: ProxyConfig | None = None) -> ProxySession | None:
-    """High-level: intercept FTNN login via hosts redirect, return authenticated session."""
+    """Single-phase: preload IP pool, trap all, launch FTNN, intercept login."""
     cfg = config or ProxyConfig()
-    bridge = _ProxyBridge(cfg)
+    ip_pool = load_ip_pool()
+    if not ip_pool:
+        logger.error("no IPs in pool — is FTNN installed?")
+        return None
+
+    bridge = _ProxyBridge(cfg, ip_pool)
     try:
         return bridge.intercept_login()
     except Exception:
