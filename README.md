@@ -110,3 +110,5 @@ FT 协议运行在 TCP 443 端口（非 TLS），32 字节大端序 Header + Pro
 ## License
 
 MIT — 基于 [v0.1 原始项目](https://github.com/bigbigmonkey123/futu-moni) 的协议逆向工作。
+
+所有代码均由 Claude 4.6 自主完成
