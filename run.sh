@@ -1,49 +1,63 @@
 #!/bin/bash
-# futu-moni 一键启动脚本
-# 用法: ./run.sh         (单次查询)
-#       ./run.sh serve    (持续服务模式，每5分钟查一次)
+# ═══════════════════════════════════════════════════════════
+#  futu-moni 一键启动
+#
+#  用法:
+#    ./run.sh              单次查询 1306/1321/1489
+#    ./run.sh serve        持续服务 (每5分钟查一次, Ctrl+C 退出)
+#    ./run.sh serve 120    持续服务, 自定义间隔 (秒)
+# ═══════════════════════════════════════════════════════════
 set -e
 
-if [ "$(id -u)" -ne 0 ]; then
-    echo "需要 root 权限，正在请求 sudo..."
-    exec sudo "$0" "$@"
-fi
+DIR="$(cd "$(dirname "$0")" && pwd)"
+VENV="$DIR/.venv"
+PY=""
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-VENV_PYTHON=""
-
-# 查找可用的 Python (优先 venv)
-if [ -f "$SCRIPT_DIR/.venv/bin/python" ]; then
-    VENV_PYTHON="$SCRIPT_DIR/.venv/bin/python"
-elif [ -f "$SCRIPT_DIR/../stock-moni/.venv/bin/python" ]; then
-    VENV_PYTHON="$SCRIPT_DIR/../stock-moni/.venv/bin/python"
-else
-    for py in python3.11 python3.12 python3.13 python3; do
-        if command -v "$py" >/dev/null 2>&1; then
-            if "$py" -c "import pydantic" 2>/dev/null; then
-                VENV_PYTHON="$py"
-                break
-            fi
+# ── 1. 找 Python 3.11+ ──────────────────────────────────
+for candidate in python3.13 python3.12 python3.11 python3; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+        ver=$("$candidate" -c "import sys; print(sys.version_info >= (3,11))" 2>/dev/null)
+        if [ "$ver" = "True" ]; then
+            PY="$candidate"
+            break
         fi
-    done
-fi
+    fi
+done
 
-if [ -z "$VENV_PYTHON" ]; then
-    echo "❌ 找不到安装了 pydantic 的 Python"
-    echo "   请运行: pip install pydantic"
+if [ -z "$PY" ]; then
+    echo "❌ 需要 Python 3.11+, 请先安装"
+    echo "   brew install python@3.13"
     exit 1
 fi
 
-cd "$SCRIPT_DIR"
+# ── 2. 自动创建 venv + 安装 ──────────────────────────────
+if [ ! -f "$VENV/bin/python" ]; then
+    echo "[setup] 首次运行, 创建虚拟环境..."
+    "$PY" -m venv "$VENV"
+    "$VENV/bin/pip" install --quiet --upgrade pip
+    "$VENV/bin/pip" install --quiet -e "$DIR"
+    echo "[setup] 安装完成 ✓"
+    echo
+fi
 
+VPYTHON="$VENV/bin/python"
+
+# ── 3. 检查是否需要 sudo ────────────────────────────────
+if [ "$(id -u)" -ne 0 ]; then
+    echo "需要 root 权限 (修改 /etc/hosts + 绑定端口 443)"
+    exec sudo "$VPYTHON" -m futu_moni "$@"
+fi
+
+# ── 4. 已是 root, 直接运行 ──────────────────────────────
 if [ "$1" = "serve" ]; then
     POLL="${2:-300}"
-    echo "持续服务模式: 每 ${POLL} 秒查询一次 (Ctrl+C 退出)"
-    exec "$VENV_PYTHON" -c "
+    exec "$VPYTHON" -c "
+import logging, signal
 from futu_moni import FutuNativeService, ServiceConfig, ProxyConfig
-import logging, signal, sys, json
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
+print('持续服务模式: 每 ${POLL} 秒查询一次 (Ctrl+C 退出)')
+print()
 
 config = ServiceConfig(
     use_proxy=True,
@@ -64,5 +78,5 @@ signal.signal(signal.SIGTERM, lambda *_: service.stop())
 service.run()
 "
 else
-    exec "$VENV_PYTHON" -m futu_moni
+    exec "$VPYTHON" -m futu_moni
 fi

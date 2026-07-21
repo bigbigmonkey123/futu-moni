@@ -20,6 +20,9 @@ classifiers = [
     "Topic :: Office/Business :: Financial :: Investment",
 ]
 
+[project.scripts]
+futu-moni = "futu_moni.__main__:main"
+
 [project.urls]
 Repository = "https://github.com/bigbigmonkey123/futu-moni"
 
