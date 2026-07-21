@@ -30,24 +30,26 @@ security_id 从 FTNN 本地 SQLite (`~/.com.futunn.FutuOpenD/F3CNN/SecListDB.v13
 
 FT 协议的 LOGIN token 是**服务端一次性消耗**的——FTNN 发出后立刻失效，packet replay 永远不行。
 
-解决方案：**PF rdr + route MITM 代理**
+解决方案：**/etc/hosts 域名劫持**
 
 ```
-                  route add -host <22个Futu IP> -interface lo0
-                  pfctl rdr on lo0 port 443 → 127.0.0.1:19443
+1. DNS 解析 nnproxy.futunn.com → 获取真实 IP（如 170.106.200.199）
+2. 写入 /etc/hosts: 127.0.0.1 nnproxy.futunn.com nnproxy2.futunn.com
+3. 监听 127.0.0.1:443
 
-FTNN ─[LOGIN]→ lo0 ─[PF rdr]→ 本地代理:19443 ─→ 真实 Futu 服务器:443
-                                    │
-                           LOGIN 成功后：
-                           1. 断开 FTNN↔代理 的连接
-                           2. 保留 代理↔服务器 的 TCP socket
-                           3. 在这个 socket 上注入 QUOTE 查询
+FTNN ─[LOGIN]→ nnproxy.futunn.com(→127.0.0.1) → 本地代理:443 ─→ 真实服务器
+                                                      │
+                                             LOGIN 成功后：
+                                             1. 断开 FTNN↔代理 的连接
+                                             2. 保留 代理↔服务器 的 TCP socket
+                                             3. 恢复 /etc/hosts + 刷新 DNS
+                                             4. 在 socket 上注入 QUOTE 查询
 ```
 
 关键细节：
-- `proxy.py:KNOWN_FUTU_SERVERS` — 22 个已知 Futu 服务器 IP，全部 route 到 lo0
-- `proxy.py:DEFAULT_FORWARD_SERVER` — 实际转发目标 `119.28.37.206`（**不能**在 route 列表中）
-- 服务器池动态变化，如果 FTNN 连接了未知 IP 则拦截失败
+- `proxy.py:FUTU_PROXY_DOMAINS` — `nnproxy.futunn.com` + `nnproxy2.futunn.com`（从 F3CNet.framework 提取）
+- DNS 自动解析真实服务器 IP，不需要手动维护 IP 列表
+- `/etc/hosts` 修改通过 `HOSTS_MARKER` 标记，清理时只删自己的行
 - heartbeat (cmd 0x1844) 会和 QUOTE 响应混在一起，用 sequence number 过滤
 
 ## 核心数据流
@@ -70,7 +72,7 @@ FutuNativeService.run()                     # service.py — 主循环
 | `protocol.py` | FT 二进制协议：header 解析、varint、帧读写、protobuf 价格解码 | 高 — 一个字节偏移错就全挂 |
 | `models.py` | Pydantic 模型，fail-closed 验证（decision 必须匹配证据） | 中 — 模型验证很严格 |
 | `adapter.py` | `NativeQuoteClient`（packet replay）+ `ProxyQuoteClient`（MITM）| 中 |
-| `proxy.py` | `_ProxyBridge`：PF 规则、路由、代理监听、LOGIN 拦截 | 高 — 涉及系统级操作 |
+| `proxy.py` | `_ProxyBridge`：/etc/hosts 劫持、代理监听、LOGIN 拦截 | 中 — 只改 hosts 文件 |
 | `service.py` | `FutuNativeService`：主循环、重连、backoff、health 追踪 | 低 |
 
 ## 使用方法
@@ -105,8 +107,9 @@ sudo stock-moni poc futu-native-serve --proxy --poll-interval 300 -v
 
 1. **端口 443 没有被占用**：`lsof -nP -iTCP:443 | grep LISTEN` — 必须为空
 2. **富途牛牛没有在运行**：代理启动后会自动 `open /Applications/富途牛牛.app`
-3. **有 root 权限**：pfctl 和 route 命令需要
+3. **有 root 权限**：/etc/hosts 修改和端口 443 绑定需要
 4. **SecListDB 存在**：`ls ~/.com.futunn.FutuOpenD/F3CNN/SecListDB.v13.dat`
+5. **DNS 可解析**：`dig +short nnproxy.futunn.com` — 必须返回 IP
 
 ## 输出格式
 
@@ -135,10 +138,9 @@ sudo stock-moni poc futu-native-serve --proxy --poll-interval 300 -v
 ## 已知坑
 
 1. **FTNN 崩溃后服务不会自动重连** — 进入 backoff 但不会重新启动 FTNN 和代理
-2. **SIGKILL 泄漏 PF 规则** — 手动清理：`sudo pfctl -d && sudo route delete -host <ip>`
-3. **服务器池变化** — 如果 FTNN 连接了不在 `KNOWN_FUTU_SERVERS` 里的 IP，LOGIN 拦截不到
-4. **forward server 不稳定** — `49.51.78.83` 曾经拒绝登录，`119.28.37.206` 目前可用
-5. **SSH tunnel 占端口** — colima SSH mux 曾经占用 `*:443`，导致代理无法绑定
+2. **SIGKILL 残留 hosts 条目** — 手动清理：编辑 `/etc/hosts` 删除含 `futu-moni-proxy` 的行
+3. **DNS 解析变化** — 如果 `nnproxy.futunn.com` 解析到的 IP 拒绝登录，可用 `--forward-server` 手动指定
+4. **SSH tunnel 占端口** — colima SSH mux 曾经占用 `*:443`，导致代理无法绑定
 
 ## 测试
 
@@ -152,4 +154,4 @@ pytest tests/ -v
 
 ## experiments/ 目录
 
-5 个实验脚本记录了从 lo0 IP alias → PF rdr 的探索过程。**`ft_pf_proxy.py` 是最终成功的方案**，其逻辑已集成到 `proxy.py`。
+5 个实验脚本记录了从 lo0 IP alias → PF rdr → /etc/hosts 的探索过程。**`ft_pf_proxy.py` 是 PF 阶段的突破**，后来进化为更简单的 /etc/hosts 域名劫持方案，已集成到 `proxy.py`。

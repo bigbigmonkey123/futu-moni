@@ -1,10 +1,10 @@
-"""PF-based MITM proxy for intercepting FTNN's FT protocol login.
+"""Hosts-based MITM proxy for intercepting FTNN's FT protocol login.
 
-Sets up macOS route + PF rdr rules to redirect FTNN's outbound connections
-through a local proxy. When FTNN logs in, the proxy captures the authenticated
-remote socket for query injection.
+Temporarily redirects FTNN's server domains to localhost via /etc/hosts,
+captures the authenticated TCP socket when FTNN logs in, then restores
+DNS and injects QUOTE queries on the hijacked connection.
 
-Requires root privileges for pfctl and route commands.
+Requires root privileges for /etc/hosts and binding port 443.
 """
 
 from __future__ import annotations
@@ -27,39 +27,42 @@ from futu_moni.protocol import (
 
 logger = logging.getLogger(__name__)
 
-KNOWN_FUTU_SERVERS = (
-    "170.106.62.204", "170.106.48.217", "170.106.49.111",
-    "170.106.201.247", "170.106.201.73",
-    "43.130.30.145", "43.130.30.93",
-    "43.175.134.104",
-    "43.135.64.109", "43.135.82.18",
-    "43.132.138.67",
-    "43.152.136.145", "43.152.2.73",
-    "43.159.177.6",
-    "119.28.37.206", "119.28.37.77",
-    "49.51.78.222", "49.51.78.82", "49.51.78.83",
-    "49.234.241.65",
-    "124.156.234.231", "124.156.233.215",
-    "129.226.111.140",
-)
-
-DEFAULT_FORWARD_SERVER = "119.28.37.206"
-PROXY_PORT = 19443
+FUTU_PROXY_DOMAINS = ("nnproxy.futunn.com", "nnproxy2.futunn.com")
+HOSTS_MARKER = "# futu-moni-proxy"
+HOSTS_PATH = "/etc/hosts"
 
 
 @dataclass
 class ProxyConfig:
-    forward_server: str = DEFAULT_FORWARD_SERVER
+    forward_server: str = ""
     forward_port: int = 443
-    proxy_port: int = PROXY_PORT
     login_timeout_seconds: float = 120.0
-    extra_servers: tuple[str, ...] = ()
+    domains: tuple[str, ...] = FUTU_PROXY_DOMAINS
 
 
 @dataclass
 class ProxySession:
     socket: SocketLike
     user_id: int
+
+
+def _resolve_forward_server(domains: tuple[str, ...], port: int) -> str:
+    """Resolve real server IP from DNS before we modify /etc/hosts."""
+    for domain in domains:
+        try:
+            results = socket.getaddrinfo(domain, port, socket.AF_INET, socket.SOCK_STREAM)
+            if results:
+                ip = results[0][4][0]
+                logger.info("resolved %s -> %s", domain, ip)
+                return ip
+        except socket.gaierror:
+            continue
+    raise RuntimeError(f"cannot resolve any of {domains}")
+
+
+def _flush_dns() -> None:
+    subprocess.run(["dscacheutil", "-flushcache"], capture_output=True)
+    subprocess.run(["killall", "-HUP", "mDNSResponder"], capture_output=True)
 
 
 def _ft_frame(data: bytes | bytearray, offset: int = 0):
@@ -79,7 +82,7 @@ def _ft_frame(data: bytes | bytearray, offset: int = 0):
 
 
 class _ProxyBridge:
-    """Manages the PF rules, routes, and proxy listener for one login cycle."""
+    """Manages /etc/hosts redirect and proxy listener for one login cycle."""
 
     def __init__(self, config: ProxyConfig) -> None:
         self.config = config
@@ -87,34 +90,43 @@ class _ProxyBridge:
         self._login_done = threading.Event()
         self._session: ProxySession | None = None
         self._lock = threading.Lock()
-        all_servers = set(KNOWN_FUTU_SERVERS) | set(config.extra_servers)
-        self._trap_ips = sorted(ip for ip in all_servers if ip != config.forward_server)
 
-    def _setup_routes(self) -> None:
-        for ip in self._trap_ips:
-            subprocess.run(
-                ["route", "add", "-host", ip, "-interface", "lo0"],
-                capture_output=True,
+        if config.forward_server:
+            self._forward_ip = config.forward_server
+        else:
+            self._forward_ip = _resolve_forward_server(
+                config.domains, config.forward_port,
             )
 
-    def _setup_pf(self) -> None:
-        rule = f"rdr pass on lo0 proto tcp from any to any port 443 -> 127.0.0.1 port {self.config.proxy_port}\n"
-        subprocess.run(["pfctl", "-ef", "-"], input=rule, capture_output=True, text=True)
+    def _setup_hosts(self) -> None:
+        domains_str = " ".join(self.config.domains)
+        entry = f"127.0.0.1 {domains_str} {HOSTS_MARKER}\n"
+        with open(HOSTS_PATH, "r") as f:
+            lines = f.readlines()
+        lines = [l for l in lines if HOSTS_MARKER not in l]
+        lines.append(entry)
+        with open(HOSTS_PATH, "w") as f:
+            f.writelines(lines)
+        _flush_dns()
+        logger.info("hosts: redirected %s -> 127.0.0.1", ", ".join(self.config.domains))
 
-    def _cleanup_routes(self) -> None:
-        for ip in self._trap_ips:
-            subprocess.run(
-                ["route", "delete", "-host", ip],
-                capture_output=True,
-            )
-
-    def _cleanup_pf(self) -> None:
-        subprocess.run(["pfctl", "-d"], capture_output=True)
+    def _cleanup_hosts(self) -> None:
+        try:
+            with open(HOSTS_PATH, "r") as f:
+                lines = f.readlines()
+            clean = [l for l in lines if HOSTS_MARKER not in l]
+            if len(clean) != len(lines):
+                with open(HOSTS_PATH, "w") as f:
+                    f.writelines(clean)
+                _flush_dns()
+                logger.info("hosts: restored")
+        except OSError:
+            pass
 
     def _handle_connection(self, csock: socket.socket) -> None:
         try:
             rsock = socket.create_connection(
-                (self.config.forward_server, self.config.forward_port),
+                (self._forward_ip, self.config.forward_port),
                 timeout=10,
             )
         except OSError:
@@ -181,14 +193,12 @@ class _ProxyBridge:
                 rsock.close()
 
     def intercept_login(self) -> ProxySession | None:
-        """Set up proxy, launch FTNN, wait for login. Returns session or None on timeout."""
-        self._setup_routes()
-        self._setup_pf()
-        logger.info("proxy: PF rules and routes configured (%d IPs trapped)", len(self._trap_ips))
+        """Set up hosts redirect, launch FTNN, wait for login."""
+        self._setup_hosts()
 
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        srv.bind(("127.0.0.1", self.config.proxy_port))
+        srv.bind(("127.0.0.1", self.config.forward_port))
         srv.listen(20)
         srv.settimeout(2.0)
 
@@ -212,20 +222,18 @@ class _ProxyBridge:
         self._login_done.wait(timeout=self.config.login_timeout_seconds)
         self._stop.set()
 
-        self._cleanup_routes()
-        self._cleanup_pf()
+        self._cleanup_hosts()
 
         with self._lock:
             return self._session
 
     def cleanup(self) -> None:
         self._stop.set()
-        self._cleanup_routes()
-        self._cleanup_pf()
+        self._cleanup_hosts()
 
 
 def obtain_authenticated_session(config: ProxyConfig | None = None) -> ProxySession | None:
-    """High-level: intercept FTNN login via MITM proxy, return authenticated session."""
+    """High-level: intercept FTNN login via hosts redirect, return authenticated session."""
     cfg = config or ProxyConfig()
     bridge = _ProxyBridge(cfg)
     try:
