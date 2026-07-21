@@ -1,0 +1,512 @@
+{
+  "$defs": {
+    "Decision": {
+      "enum": [
+        "CONDITIONAL_GO",
+        "NO_GO"
+      ],
+      "title": "Decision",
+      "type": "string"
+    },
+    "LoginPacketMetadata": {
+      "properties": {
+        "exists": {
+          "title": "Exists",
+          "type": "boolean"
+        },
+        "is_regular_file": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Is Regular File"
+        },
+        "symlink": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Symlink"
+        },
+        "mode_octal": {
+          "anyOf": [
+            {
+              "pattern": "^[0-7]{4}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mode Octal"
+        },
+        "size_bucket": {
+          "enum": [
+            "absent",
+            "0",
+            "1-512",
+            "513-2048",
+            "2049-8192",
+            ">8192"
+          ],
+          "title": "Size Bucket",
+          "type": "string"
+        },
+        "path_policy": {
+          "enum": [
+            "default",
+            "environment",
+            "cli"
+          ],
+          "title": "Path Policy",
+          "type": "string"
+        },
+        "format_valid": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Format Valid"
+        },
+        "session_status": {
+          "$ref": "#/$defs/SessionStatus"
+        },
+        "check_login_attempted": {
+          "default": false,
+          "title": "Check Login Attempted",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "exists",
+        "size_bucket",
+        "path_policy",
+        "session_status"
+      ],
+      "title": "LoginPacketMetadata",
+      "type": "object"
+    },
+    "MappingStatus": {
+      "enum": [
+        "resolved",
+        "missing",
+        "ambiguous",
+        "db_unavailable"
+      ],
+      "title": "MappingStatus",
+      "type": "string"
+    },
+    "Quality": {
+      "properties": {
+        "status": {
+          "$ref": "#/$defs/QualityStatus"
+        },
+        "completeness": {
+          "maximum": 1,
+          "minimum": 0,
+          "title": "Completeness",
+          "type": "number"
+        },
+        "issues": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Issues",
+          "type": "array"
+        }
+      },
+      "required": [
+        "status",
+        "completeness"
+      ],
+      "title": "Quality",
+      "type": "object"
+    },
+    "QualityStatus": {
+      "enum": [
+        "pass",
+        "warn",
+        "fail"
+      ],
+      "title": "QualityStatus",
+      "type": "string"
+    },
+    "QuoteObservation": {
+      "properties": {
+        "source": {
+          "const": "futu_native_app_session",
+          "default": "futu_native_app_session",
+          "title": "Source",
+          "type": "string"
+        },
+        "upstream_commit": {
+          "const": "f2a73dfad47cc546cf79578512b3f9408776a620",
+          "default": "f2a73dfad47cc546cf79578512b3f9408776a620",
+          "title": "Upstream Commit",
+          "type": "string"
+        },
+        "symbol": {
+          "enum": [
+            "1306",
+            "1321",
+            "1489"
+          ],
+          "title": "Symbol",
+          "type": "string"
+        },
+        "market": {
+          "const": "JP",
+          "default": "JP",
+          "title": "Market",
+          "type": "string"
+        },
+        "currency": {
+          "const": "JPY",
+          "default": "JPY",
+          "title": "Currency",
+          "type": "string"
+        },
+        "last": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Last"
+        },
+        "prev_close": {
+          "anyOf": [
+            {
+              "exclusiveMinimum": 0.0,
+              "type": "number"
+            },
+            {
+              "pattern": "^(?!^[-+.]*$)[+-]?0*\\d*\\.?\\d*$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Prev Close"
+        },
+        "observed_at": {
+          "format": "date-time",
+          "title": "Observed At",
+          "type": "string"
+        },
+        "market_as_of": {
+          "default": null,
+          "title": "Market As Of",
+          "type": "null"
+        },
+        "market_as_of_status": {
+          "const": "unknown",
+          "default": "unknown",
+          "title": "Market As Of Status",
+          "type": "string"
+        },
+        "status": {
+          "$ref": "#/$defs/QuoteStatus"
+        },
+        "unit": {
+          "default": "unknown",
+          "enum": [
+            "nanounits_1e9",
+            "unknown"
+          ],
+          "title": "Unit",
+          "type": "string"
+        },
+        "issues": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Issues",
+          "type": "array"
+        }
+      },
+      "required": [
+        "symbol",
+        "observed_at",
+        "status"
+      ],
+      "title": "QuoteObservation",
+      "type": "object"
+    },
+    "QuoteStatus": {
+      "enum": [
+        "success",
+        "not_attempted",
+        "login_required",
+        "seclist_missing",
+        "seclist_ambiguous",
+        "seclist_unavailable",
+        "server_not_allowlisted",
+        "network_error",
+        "timeout",
+        "framing_error",
+        "parse_error",
+        "rate_limited"
+      ],
+      "title": "QuoteStatus",
+      "type": "string"
+    },
+    "RedactionState": {
+      "properties": {
+        "packet_bytes_emitted": {
+          "const": false,
+          "default": false,
+          "title": "Packet Bytes Emitted",
+          "type": "boolean"
+        },
+        "user_id_emitted": {
+          "const": false,
+          "default": false,
+          "title": "User Id Emitted",
+          "type": "boolean"
+        },
+        "full_path_emitted": {
+          "const": false,
+          "default": false,
+          "title": "Full Path Emitted",
+          "type": "boolean"
+        },
+        "raw_payload_emitted": {
+          "const": false,
+          "default": false,
+          "title": "Raw Payload Emitted",
+          "type": "boolean"
+        }
+      },
+      "title": "RedactionState",
+      "type": "object"
+    },
+    "SecListMetadata": {
+      "properties": {
+        "database_status": {
+          "enum": [
+            "available_readonly",
+            "unavailable"
+          ],
+          "title": "Database Status",
+          "type": "string"
+        },
+        "mappings": {
+          "items": {
+            "$ref": "#/$defs/SecurityMapping"
+          },
+          "title": "Mappings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "database_status",
+        "mappings"
+      ],
+      "title": "SecListMetadata",
+      "type": "object"
+    },
+    "SecurityMapping": {
+      "properties": {
+        "symbol": {
+          "enum": [
+            "1306",
+            "1321",
+            "1489"
+          ],
+          "title": "Symbol",
+          "type": "string"
+        },
+        "market": {
+          "const": "JP",
+          "default": "JP",
+          "title": "Market",
+          "type": "string"
+        },
+        "market_code": {
+          "const": 830,
+          "default": 830,
+          "title": "Market Code",
+          "type": "integer"
+        },
+        "status": {
+          "$ref": "#/$defs/MappingStatus"
+        },
+        "active": {
+          "default": false,
+          "title": "Active",
+          "type": "boolean"
+        },
+        "name_present": {
+          "default": false,
+          "title": "Name Present",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "symbol",
+        "status"
+      ],
+      "title": "SecurityMapping",
+      "type": "object"
+    },
+    "SessionStatus": {
+      "enum": [
+        "absent",
+        "not_regular_file",
+        "symlink_rejected",
+        "permission_insecure",
+        "read_error",
+        "invalid_format",
+        "server_not_allowlisted",
+        "not_attempted",
+        "login_ok",
+        "login_rejected",
+        "network_error",
+        "timeout",
+        "framing_error",
+        "parse_error"
+      ],
+      "title": "SessionStatus",
+      "type": "string"
+    }
+  },
+  "description": "One redacted report. It cannot represent a production Go decision.",
+  "properties": {
+    "schema_version": {
+      "const": "1.0.0",
+      "default": "1.0.0",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "source": {
+      "const": "futu_native_app_session",
+      "default": "futu_native_app_session",
+      "title": "Source",
+      "type": "string"
+    },
+    "upstream_commit": {
+      "const": "f2a73dfad47cc546cf79578512b3f9408776a620",
+      "default": "f2a73dfad47cc546cf79578512b3f9408776a620",
+      "title": "Upstream Commit",
+      "type": "string"
+    },
+    "observed_at": {
+      "format": "date-time",
+      "title": "Observed At",
+      "type": "string"
+    },
+    "market_as_of": {
+      "default": null,
+      "title": "Market As Of",
+      "type": "null"
+    },
+    "market_as_of_status": {
+      "const": "unknown",
+      "default": "unknown",
+      "title": "Market As Of Status",
+      "type": "string"
+    },
+    "market": {
+      "const": "JP",
+      "default": "JP",
+      "title": "Market",
+      "type": "string"
+    },
+    "currency": {
+      "const": "JPY",
+      "default": "JPY",
+      "title": "Currency",
+      "type": "string"
+    },
+    "symbols_requested": {
+      "items": {
+        "enum": [
+          "1306",
+          "1321",
+          "1489"
+        ],
+        "type": "string"
+      },
+      "title": "Symbols Requested",
+      "type": "array"
+    },
+    "server_allowlisted": {
+      "title": "Server Allowlisted",
+      "type": "boolean"
+    },
+    "auth": {
+      "$ref": "#/$defs/LoginPacketMetadata"
+    },
+    "seclist": {
+      "$ref": "#/$defs/SecListMetadata"
+    },
+    "quotes": {
+      "items": {
+        "$ref": "#/$defs/QuoteObservation"
+      },
+      "title": "Quotes",
+      "type": "array"
+    },
+    "quality": {
+      "$ref": "#/$defs/Quality"
+    },
+    "decision": {
+      "$ref": "#/$defs/Decision"
+    },
+    "redaction": {
+      "$ref": "#/$defs/RedactionState"
+    },
+    "automatic_trading": {
+      "const": false,
+      "default": false,
+      "title": "Automatic Trading",
+      "type": "boolean"
+    },
+    "default_provider": {
+      "const": false,
+      "default": false,
+      "title": "Default Provider",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "observed_at",
+    "symbols_requested",
+    "server_allowlisted",
+    "auth",
+    "seclist",
+    "quotes",
+    "quality",
+    "decision"
+  ],
+  "title": "FutuNativeReport",
+  "type": "object"
+}

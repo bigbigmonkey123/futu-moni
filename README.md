@@ -1,143 +1,112 @@
 # futu-moni
 
-Standalone market data client for [Futu/Moomoo](https://www.futunn.com) using the native FT protocol. No OpenD, no API key, no SDK required.
+通过富途牛牛原生 FT 协议获取 JP 市场数据的独立服务。不使用 OpenD，不需要 API key。
 
-Connects directly to Futu quote servers via TCP + Protobuf on port 443, the same protocol the desktop app uses internally.
+> v0.2: 从单次命令行工具升级为**长期运行服务** + **MITM 代理自动认证**
 
----
+## v0.2 升级要点
 
-## 中文介绍
+| 项目 | v0.1 (上游) | v0.2 (本版) |
+|------|-------------|-------------|
+| 认证方式 | tcpdump 抓包 → 手动 replay | MITM 代理自动拦截 FTNN 的 LOGIN |
+| 运行模式 | 单次 CLI 查询 | 长期运行服务，可持续查询 10+次/天 |
+| token 问题 | 一次性 token 消耗后需重新抓包 | 每次启动自动获取新 token |
+| 架构 | 单文件脚本 | 模块化: protocol / adapter / proxy / service |
+| 数据模型 | print 输出 | Pydantic 模型，JSON 输出，fail-closed |
 
-把 Futu/Moomoo 桌面客户端的闭源行情通道，变成一个可编程的命令行工具。
+## 原理
 
-### 为什么做
+富途 FT 协议使用一次性登录 token，无法 replay。本项目通过 macOS PF rdr + route 规则搭建本地 MITM 代理，拦截 FTNN 桌面端的 LOGIN 认证，获取已认证的 TCP 连接，在上面注入 QUOTE 查询。
 
-Futu 官方 OpenD API **不支持日本市场数据**，但桌面客户端能看到日股行情——数据通道存在，只是没有开放。futu-moni 的思路：**逆向客户端协议，自己拿数据。**
-
-### 核心技术点
-
-1. **FT 协议逆向** — TCP 443 端口纯明文通信，私有 FT 协议：32 字节大端序 Header + Protobuf Body。关键命令 CMD `0x1AA8`，selector 0 返回实时价格（纳单位 ÷10⁹）
-2. **登录包重放认证** — 登录用 RSA + 随机填充加密，无法从零构造。方案：用 `tcpdump` 抓取客户端登录包，连接时直接重放，User ID 从包头自动提取
-3. **多市场路由** — 同一个查询命令，通过 route 字段区分市场：港股→1，美股→11，日股→1001
-4. **证券 ID 解析** — 协议层使用内部数字 ID，从客户端本地 SQLite 数据库（SecListDB ~79MB）查找，自动按市场优先级去重
-
-### 踩过的坑
-
-- **合并请求只返回第一只** — 多只股票塞一个请求，服务端只返回第一只，改为逐只发送
-- **响应有非标前缀** — Protobuf 数据前有 4-6 字节自定义头，搜索 varint 标记定位数据起始位置
-- **单位不统一** — 指数推送用毫单位（÷1000），个股查询用纳单位（÷10⁹），混用差 6 个数量级
-
-### 项目特点
-
-- 零依赖，纯 Python 标准库
-- 单文件，一个 `.py` 搞定
-- 港股 / 美股 / 日股统一接口
-- 主动查询，按需获取实时数据
-- 完全脱敏开源
-
----
-
-## Supported Markets
-
-| Market | Route | Examples |
-|--------|-------|---------|
-| Hong Kong (HK) | 1 | 00700, 09988 |
-| United States (US) | 11 | AAPL, NVDA, TSLA |
-| Japan (JP) | 1001 | 1306, 1321, 1489 |
-
-## Requirements
-
-- Python 3.8+
-- macOS (login capture uses `tcpdump`)
-- Futu/Moomoo desktop app installed (for authentication and security database)
-- No additional Python packages needed — stdlib only
-
-## Quick Start
-
-### 1. Capture a login packet
-
-The client authenticates by replaying a login packet captured from your running Futu app session.
-
-```bash
-# Auto-capture: waits for the app to start, then captures
-python futu_moni.py --auto-capture
-
-# Manual capture: app must already be running
-python futu_moni.py --capture-login
+```
+FTNN App  ──[LOGIN]──> lo0 ──[PF rdr]──> 本地代理 :19443 ──> 富途服务器 :443
+                                              │
+                                     拦截 LOGIN 成功后
+                                     在远端 socket 上注入 QUOTE 查询
 ```
 
-The captured packet is saved to `~/.futu-moni/login_replay.bin`. It expires when your app session ends — re-capture when needed.
+### 为什么不能用 packet replay？
 
-### 2. Query any stock
+v0.1 用 tcpdump 抓登录包再重放。但 FT 协议的 LOGIN token 是**服务端一次性消耗**的——FTNN 发出后服务端就标记已用，重放永远返回 rejected。MITM 代理解决了这个根本问题：让 FTNN 自己完成认证，我们只是"借用"认证后的连接。
 
-```bash
-# Query specific stocks across markets
-python futu_moni.py --query 00700 AAPL 1306
+### 为什么不用 lo0 IP alias？
 
-# Output:
-#   00700      Tencent Holdings Ltd.          HK       388.200      384.000  +1.09%
-#   AAPL       Apple Inc                      US       198.110      196.890  +0.62%
-#   1306       NEXT FUNDS TOPIX ETF           JP     2,781.000    2,770.000  +0.40%
+最初尝试在 lo0 上添加 IP alias 拦截流量，但 macOS 内核有一个 bug：Python 的 `accept()` 在 lo0 alias IP 上永远不返回（尽管 TCP 三次握手已完成，`nc` 能正常工作）。改用 PF rdr 规则绕过了这个问题。
+
+## 目标证券
+
+| 代码 | 名称 | 市场 |
+|------|------|------|
+| 1306 | NEXT FUNDS TOPIX ETF | JP |
+| 1321 | Nikkei 225 ETF | JP |
+| 1489 | NF 日経高配当50 ETF | JP |
+
+## 快速开始
+
+需要 macOS + root 权限（pfctl/route 操作）+ 富途牛牛已安装。
+
+```python
+from futu_moni import FutuNativeService, ServiceConfig, ProxyConfig
+
+config = ServiceConfig(
+    use_proxy=True,
+    proxy=ProxyConfig(forward_server="119.28.37.206"),
+    poll_interval_seconds=300,  # 每 5 分钟查询一次
+)
+
+def on_report(report, health):
+    for q in report.quotes:
+        if q.last:
+            print(f"{q.symbol}: {q.last} JPY")
+
+service = FutuNativeService(config, on_report=on_report)
+service.run()  # 阻塞运行，Ctrl+C 退出
 ```
 
-### 3. Full JP market report
+服务启动后会自动：
+1. 配置 PF rdr 规则 + host routes (22+ IP → lo0)
+2. 启动富途牛牛
+3. 拦截 FTNN 的 LOGIN 获取认证连接
+4. 按间隔循环查询 1306/1321/1489 报价
+5. 退出时清理 PF 规则和路由
 
-```bash
-# Run with no arguments for a complete Japanese market overview
-python futu_moni.py
+## 项目结构
+
+```
+futu-moni/
+├── src/futu_moni/          # 生产代码
+│   ├── protocol.py         # FT wire protocol (32-byte header, protobuf payload)
+│   ├── models.py           # Pydantic 数据模型 (fail-closed)
+│   ├── adapter.py          # NativeQuoteClient + ProxyQuoteClient
+│   ├── proxy.py            # PF rdr MITM 代理 (_ProxyBridge)
+│   └── service.py          # 长期运行服务 (FutuNativeService)
+├── tests/                  # 单元测试
+├── experiments/            # 实验脚本迭代记录 (从 v0.1 到 v0.2 的探索过程)
+├── upstream/               # v0.1 原始代码参考
+└── docs/                   # JSON schema, 示例输出
 ```
 
-This shows:
-- Japanese indices (Nikkei 225, TOPIX, JPX-Nikkei 400)
-- TOPIX-17 sector rankings (top/bottom movers)
-- N225 constituent rankings (losers, turnover leaders)
-- Target ETF prices
+## 协议细节
 
-## Commands
+FT 协议运行在 TCP 443 端口（非 TLS），32 字节大端序 Header + Protobuf Body：
 
-| Command | Description |
-|---------|-------------|
-| *(no args)* | Full JP market report |
-| `--query CODE1 CODE2 ...` | Query live prices for any stock codes |
-| `--lookup CODE1 CODE2 ...` | Look up security IDs from local database |
-| `--capture-login` | Capture login packet (app must be running) |
-| `--auto-capture` | Wait for app to start, then auto-capture |
-| `--check-login` | Verify if saved login packet is still valid |
+| 字段 | 偏移 | 说明 |
+|------|------|------|
+| Magic | 0-1 | `"FT"` (0x46 0x54) |
+| Command | 16-17 | LOGIN=0x1771, INIT=0x1B0E, QUOTE=0x1AA8 |
+| Body Length | 18-21 | 后续 body 长度 |
+| Sequence | 12-15 | 请求序号，响应回传 |
+| Extend Head | 30-31 | extend head 长度（body 前缀） |
 
-## Configuration
+价格单位：纳单位 (÷10⁹)，日股路由号 1001。
 
-Environment variables:
+## 已知限制
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `FUTU_SERVER` | `49.51.78.83` | Override the default quote server IP |
-| `FUTU_LOGIN_PACKET` | `~/.futu-moni/login_replay.bin` | Custom login packet path |
-
-## How It Works
-
-### Authentication
-
-Futu's login uses RSA encryption with random padding — packets cannot be constructed from scratch. Instead, `futu-moni` captures a login packet from a live app session via `tcpdump` and replays it to authenticate with the quote server.
-
-### Price Queries
-
-Active price queries use CMD `0x1AA8` with selector 0, which returns current price and previous close in nanounits (÷10⁹). Each security is queried individually with market-specific routing.
-
-### Security Lookup
-
-Stock codes (like "00700" or "AAPL") are resolved to internal security IDs using Futu's local SQLite database (`SecListDB`), which is maintained by the desktop app. When a code exists in multiple markets (e.g., AAPL in US vs Canadian CDR), the preferred market is selected automatically.
-
-### Protocol
-
-The FT protocol uses a 32-byte big-endian header with magic bytes "FT", followed by a Protobuf-encoded body. Communication happens over plain TCP on port 443 (not TLS).
-
-## Limitations
-
-- **macOS only** — login capture depends on `tcpdump` and Futu's macOS app paths
-- **Session-bound** — login packets expire when the app session ends
-- **Read-only** — only fetches market data, no trading capability
-- **Single security per request** — CMD 0x1AA8 returns only the first security in combined requests, so queries are sent one at a time
+- macOS only (依赖 pfctl, route, lo0)
+- 需要 root 权限
+- FTNN 崩溃后需手动重启服务（暂无自动重连）
+- Futu 服务器池动态变化，`proxy.py` 中的已知 IP 列表可能需要更新
 
 ## License
 
-MIT
+MIT — 基于 [v0.1 原始项目](https://github.com/bigbigmonkey123/futu-moni) 的协议逆向工作。

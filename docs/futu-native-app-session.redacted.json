@@ -1,0 +1,125 @@
+{
+  "schema_version": "1.0.0",
+  "source": "futu_native_app_session",
+  "upstream_commit": "f2a73dfad47cc546cf79578512b3f9408776a620",
+  "observed_at": "2026-07-17T10:47:24.481081Z",
+  "market_as_of": null,
+  "market_as_of_status": "unknown",
+  "market": "JP",
+  "currency": "JPY",
+  "symbols_requested": [
+    "1306",
+    "1321",
+    "1489"
+  ],
+  "server_allowlisted": true,
+  "auth": {
+    "exists": false,
+    "is_regular_file": null,
+    "symlink": null,
+    "mode_octal": null,
+    "size_bucket": "absent",
+    "path_policy": "default",
+    "format_valid": null,
+    "session_status": "absent",
+    "check_login_attempted": false
+  },
+  "seclist": {
+    "database_status": "available_readonly",
+    "mappings": [
+      {
+        "symbol": "1306",
+        "market": "JP",
+        "market_code": 830,
+        "status": "resolved",
+        "active": true,
+        "name_present": true
+      },
+      {
+        "symbol": "1321",
+        "market": "JP",
+        "market_code": 830,
+        "status": "resolved",
+        "active": true,
+        "name_present": true
+      },
+      {
+        "symbol": "1489",
+        "market": "JP",
+        "market_code": 830,
+        "status": "resolved",
+        "active": true,
+        "name_present": true
+      }
+    ]
+  },
+  "quotes": [
+    {
+      "source": "futu_native_app_session",
+      "upstream_commit": "f2a73dfad47cc546cf79578512b3f9408776a620",
+      "symbol": "1306",
+      "market": "JP",
+      "currency": "JPY",
+      "last": null,
+      "prev_close": null,
+      "observed_at": "2026-07-17T10:47:24.481081Z",
+      "market_as_of": null,
+      "market_as_of_status": "unknown",
+      "status": "login_required",
+      "unit": "unknown",
+      "issues": [
+        "login_required"
+      ]
+    },
+    {
+      "source": "futu_native_app_session",
+      "upstream_commit": "f2a73dfad47cc546cf79578512b3f9408776a620",
+      "symbol": "1321",
+      "market": "JP",
+      "currency": "JPY",
+      "last": null,
+      "prev_close": null,
+      "observed_at": "2026-07-17T10:47:24.481081Z",
+      "market_as_of": null,
+      "market_as_of_status": "unknown",
+      "status": "login_required",
+      "unit": "unknown",
+      "issues": [
+        "login_required"
+      ]
+    },
+    {
+      "source": "futu_native_app_session",
+      "upstream_commit": "f2a73dfad47cc546cf79578512b3f9408776a620",
+      "symbol": "1489",
+      "market": "JP",
+      "currency": "JPY",
+      "last": null,
+      "prev_close": null,
+      "observed_at": "2026-07-17T10:47:24.481081Z",
+      "market_as_of": null,
+      "market_as_of_status": "unknown",
+      "status": "login_required",
+      "unit": "unknown",
+      "issues": [
+        "login_required"
+      ]
+    }
+  ],
+  "quality": {
+    "status": "fail",
+    "completeness": 0.0,
+    "issues": [
+      "absent"
+    ]
+  },
+  "decision": "NO_GO",
+  "redaction": {
+    "packet_bytes_emitted": false,
+    "user_id_emitted": false,
+    "full_path_emitted": false,
+    "raw_payload_emitted": false
+  },
+  "automatic_trading": false,
+  "default_provider": false
+}
