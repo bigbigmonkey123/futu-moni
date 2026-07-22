@@ -509,6 +509,215 @@ def _inspect_nested_varints(
     return output
 
 
+NANO_SCALE = Decimal(1_000_000_000)
+MILLI_SCALE = Decimal(1_000)
+
+
+def _protobuf_fields_lenient(data: bytes) -> list[tuple[int, int, int | bytes]]:
+    fields: list[tuple[int, int, int | bytes]] = []
+    position = 0
+    while position < len(data):
+        try:
+            tag, new_pos = decode_varint(data, position)
+        except NativeSessionError:
+            break
+        field_number, wire_type = tag >> 3, tag & 7
+        if field_number == 0:
+            break
+        position = new_pos
+        if wire_type == 0:
+            try:
+                value, position = decode_varint(data, position)
+            except NativeSessionError:
+                break
+        elif wire_type == 1:
+            if position + 8 > len(data):
+                break
+            value, position = data[position : position + 8], position + 8
+        elif wire_type == 2:
+            try:
+                length, position = decode_varint(data, position)
+            except NativeSessionError:
+                break
+            if position + length > len(data):
+                break
+            value, position = data[position : position + length], position + length
+        elif wire_type == 3:
+            try:
+                value, position = _read_protobuf_group(data, position, field_number)
+            except NativeSessionError:
+                break
+        elif wire_type == 5:
+            if position + 4 > len(data):
+                break
+            value, position = data[position : position + 4], position + 4
+        else:
+            break
+        fields.append((field_number, wire_type, value))
+    return fields
+
+
+def _find_security_item(payload: bytes, security_id: int) -> bytes:
+    try:
+        fields = _protobuf_fields(payload)
+    except NativeSessionError:
+        fields = _protobuf_fields_lenient(payload)
+    for field_number, wire_type, value in fields:
+        if field_number != 1 or wire_type != 2 or not isinstance(value, bytes):
+            continue
+        for number, item_wire, item_value in _protobuf_fields_lenient(value):
+            if number == 1 and item_wire == 0 and item_value == security_id:
+                return value
+    marker = b"\x08" + encode_varint(security_id)
+    idx = payload.find(marker)
+    if idx < 0:
+        raise NativeSessionError("parse_error")
+    return payload[idx:]
+
+
+def _extract_typed_payloads(item_data: bytes) -> dict[int, bytes]:
+    result: dict[int, bytes] = {}
+    for field_number, wire_type, typed in _protobuf_fields_lenient(item_data):
+        if field_number != 2 or wire_type != 2 or not isinstance(typed, bytes):
+            continue
+        subtype: int | None = None
+        data: bytes | None = None
+        for number, sub_wire, value in _protobuf_fields_lenient(typed):
+            if number == 1 and sub_wire == 0 and isinstance(value, int):
+                subtype = value
+            elif number == 2 and sub_wire == 2 and isinstance(value, bytes):
+                data = value
+        if subtype is not None and data is not None:
+            result[subtype] = data
+    return result
+
+
+def _varint_dict(data: bytes) -> dict[int, int]:
+    return {
+        number: value
+        for number, wire, value in _protobuf_fields(data)
+        if wire == 0 and isinstance(value, int)
+    }
+
+
+def _varint_dict_lenient(data: bytes) -> dict[int, int]:
+    return {
+        number: value
+        for number, wire, value in _protobuf_fields_lenient(data)
+        if wire == 0 and isinstance(value, int)
+    }
+
+
+def _parse_price(data: bytes) -> tuple[Decimal, Decimal, int | None] | None:
+    v = _varint_dict(data)
+    current, previous = v.get(1), v.get(2)
+    if current is None or previous is None or current <= 0 or previous <= 0:
+        return None
+    return Decimal(current) / NANO_SCALE, Decimal(previous) / NANO_SCALE, v.get(3)
+
+
+def _parse_order_book(data: bytes) -> list[tuple[list[tuple[Decimal, int]], list[tuple[Decimal, int]]]] | None:
+    bids: list[tuple[Decimal, int]] = []
+    asks: list[tuple[Decimal, int]] = []
+    for number, wire, value in _protobuf_fields_lenient(data):
+        if wire not in (2, 3) or not isinstance(value, bytes):
+            continue
+        if number == 1:
+            v = _varint_dict_lenient(value)
+            price, vol = v.get(1), v.get(2, 0)
+            if price is not None and price > 0:
+                bids.append((Decimal(price) / NANO_SCALE, vol))
+        elif number == 2:
+            v = _varint_dict_lenient(value)
+            price, vol = v.get(1), v.get(2, 0)
+            if price is not None and price > 0:
+                asks.append((Decimal(price) / NANO_SCALE, vol))
+    if not bids and not asks:
+        return None
+    return [(bids, asks)]
+
+
+def _parse_ohlcv(data: bytes) -> dict[str, Decimal | int | None] | None:
+    v = _varint_dict(data)
+    o = v.get(1)
+    h = v.get(2)
+    lo = v.get(3)
+    vol = v.get(4)
+    turnover = v.get(7)
+    if o is None and h is None and lo is None and vol is None:
+        return None
+    return {
+        "open": Decimal(o) / NANO_SCALE if o and o > 0 else None,
+        "high": Decimal(h) / NANO_SCALE if h and h > 0 else None,
+        "low": Decimal(lo) / NANO_SCALE if lo and lo > 0 else None,
+        "volume": vol,
+        "turnover": Decimal(turnover) / MILLI_SCALE if turnover is not None else None,
+    }
+
+
+def _parse_financial(data: bytes) -> tuple[int | None, int | None] | None:
+    v = _varint_dict(data)
+    pe = v.get(1)
+    mcap = v.get(2)
+    if pe is None and mcap is None:
+        return None
+    return pe, mcap
+
+
+def parse_quote_snapshot(frame: Frame, *, security_id: int):  # -> QuoteSnapshot
+    from futu_moni.models import (
+        FinancialData,
+        OhlcvData,
+        OrderBookData,
+        OrderBookLevel,
+        PriceData,
+        QuoteSnapshot,
+    )
+
+    if frame.command != CMD_QUOTE:
+        raise NativeSessionError("framing_error")
+
+    item = _find_security_item(frame.payload, security_id)
+    payloads = _extract_typed_payloads(item)
+
+    price: PriceData | None = None
+    if 0 in payloads:
+        parsed = _parse_price(payloads[0])
+        if parsed:
+            last, prev_close, ts = parsed
+            price = PriceData(last=last, prev_close=prev_close, timestamp_ms=ts)
+
+    order_book: OrderBookData | None = None
+    if 3 in payloads:
+        parsed_ob = _parse_order_book(payloads[3])
+        if parsed_ob:
+            raw_bids, raw_asks = parsed_ob[0]
+            order_book = OrderBookData(
+                bids=[OrderBookLevel(price=p, volume=v) for p, v in raw_bids],
+                asks=[OrderBookLevel(price=p, volume=v) for p, v in raw_asks],
+            )
+
+    ohlcv: OhlcvData | None = None
+    if 5 in payloads:
+        parsed_ohlcv = _parse_ohlcv(payloads[5])
+        if parsed_ohlcv:
+            ohlcv = OhlcvData(**parsed_ohlcv)
+
+    financial: FinancialData | None = None
+    if 8 in payloads:
+        parsed_fin = _parse_financial(payloads[8])
+        if parsed_fin:
+            financial = FinancialData(pe_raw=parsed_fin[0], market_cap_raw=parsed_fin[1])
+
+    return QuoteSnapshot(
+        security_id=security_id,
+        price=price,
+        order_book=order_book,
+        ohlcv=ohlcv,
+        financial=financial,
+    )
+
+
 def parse_quote_prices(frame: Frame, *, security_id: int) -> tuple[Decimal, Decimal]:
     if frame.command != CMD_QUOTE:
         raise NativeSessionError("framing_error")

@@ -7,7 +7,7 @@ MITM proxy that intercepts FTNN (富途牛牛) desktop app's native FT binary pr
 ```bash
 uv sync                        # install deps
 uv pip install pytest          # no test extra declared
-uv run pytest tests/ -v        # run all tests (28 tests, no root needed)
+uv run pytest tests/ -v        # run all tests (39 tests, no root needed)
 ```
 
 Entry point: `python -m futu_moni` (NOT `futu_moni.main`). Requires root.
@@ -209,16 +209,11 @@ TARGET_SYMBOLS = ["1306", "1321", "1489"]
 
 ## Tests
 
-28 tests total, all pure unit tests (no root, no network, no FTNN):
+39 tests total, all pure unit tests (no root, no network, no FTNN):
 - `test_proxy.py` (8): route-lift mock, ConnIpRsp protobuf parsing, IP filtering, malformed input
 - `test_futu_native_service.py` (11): service lifecycle, backoff, reconnect, health tracking
 - `test_protocol_inspection.py` (9): sanitized shape inspection, malformed/missing fail-closed, uint64/group handling, selector allowlist
-
-Phase A evidence and the complete capability matrix are under
-`.codex-shared/evidence-market-fields/`. Only `last`/`prev_close` remain in the
-production model; newly mapped fields are diagnostic evidence until a separate
-Phase B contract is approved. `market_as_of`, NAV/iNAV, and premium-discount
-remain unqualified and must not be inferred.
+- `test_quote_snapshot.py` (11): multi-selector snapshot parsing, order book multi-level, OHLCV/financial extraction, fail-closed edge cases
 
 ## Approaches That Failed (don't retry)
 

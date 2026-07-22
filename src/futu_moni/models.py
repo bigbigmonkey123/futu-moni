@@ -129,6 +129,55 @@ class QuoteObservation(BaseModel):
         return self
 
 
+class PriceData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    last: Decimal = Field(gt=0)
+    prev_close: Decimal = Field(gt=0)
+    timestamp_ms: int | None = None
+
+
+class OrderBookLevel(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    price: Decimal = Field(gt=0)
+    volume: int = Field(ge=0)
+
+
+class OrderBookData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    bids: list[OrderBookLevel]
+    asks: list[OrderBookLevel]
+
+
+class OhlcvData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    open: Decimal | None = Field(default=None, gt=0)
+    high: Decimal | None = Field(default=None, gt=0)
+    low: Decimal | None = Field(default=None, gt=0)
+    volume: int | None = Field(default=None, ge=0)
+    turnover: Decimal | None = Field(default=None, ge=0)
+
+
+class FinancialData(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    pe_raw: int | None = None
+    market_cap_raw: int | None = None
+
+
+class QuoteSnapshot(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    security_id: int
+    price: PriceData | None = None
+    order_book: OrderBookData | None = None
+    ohlcv: OhlcvData | None = None
+    financial: FinancialData | None = None
+
+
 class Quality(BaseModel):
     model_config = ConfigDict(frozen=True)
 

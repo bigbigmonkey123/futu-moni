@@ -37,6 +37,7 @@ from futu_moni.protocol import (
     CMD_QUOTE,
     HEADER_LENGTH,
     MAX_BODY_LENGTH,
+    Frame,
     NativeSessionError,
     SocketLike,
     build_extend_head,
@@ -44,6 +45,7 @@ from futu_moni.protocol import (
     build_quote_request,
     parse_login_result,
     parse_quote_prices,
+    parse_quote_snapshot,
     read_frame,
     read_frame_for_command,
     validate_login_packet,
@@ -57,6 +59,77 @@ DEFAULT_SECLIST_PATHS = (
 DEFAULT_SERVER = "49.51.78.83"
 JP_MARKET_CODE = 830
 JP_ROUTE = 1001
+
+ROUTE_OVERRIDES: dict[int, int] = {830: 1001}
+MARKET_GROUPS: dict[int, tuple[int, ...]] = {
+    11: (11, 12, 13),
+}
+
+
+@dataclass(frozen=True)
+class ResolvedSecurity:
+    code: str
+    market_code: int
+    security_id: int
+    route: int
+    name: str | None = None
+
+
+def market_route(market_code: int) -> int:
+    return ROUTE_OVERRIDES.get(market_code, market_code)
+
+
+def _normalize_code(market_code: int, code: str) -> list[str]:
+    candidates = [code]
+    if market_code == 1 and code.isdigit() and len(code) < 5:
+        candidates.append(code.zfill(5))
+    return candidates
+
+
+def resolve_securities(
+    codes: list[tuple[int, str]],
+    paths: tuple[Path, ...] = DEFAULT_SECLIST_PATHS,
+) -> list[ResolvedSecurity | None]:
+    database = next((p for p in paths if p.is_file()), None)
+    if database is None:
+        return [None] * len(codes)
+    try:
+        connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True)
+        try:
+            results: list[ResolvedSecurity | None] = []
+            for mkt, code in codes:
+                markets = MARKET_GROUPS.get(mkt, (mkt,))
+                candidates = _normalize_code(mkt, code)
+                row = None
+                actual_mkt = mkt
+                for m in markets:
+                    for c in candidates:
+                        row = connection.execute(
+                            "SELECT id, name_en, market_code FROM security "
+                            "WHERE code=? AND market_code=? AND delete_flag=0 AND delisted=0 "
+                            "LIMIT 1",
+                            (c, m),
+                        ).fetchone()
+                        if row is not None:
+                            actual_mkt = int(row[2])
+                            break
+                    if row is not None:
+                        break
+                if row is None:
+                    results.append(None)
+                else:
+                    results.append(ResolvedSecurity(
+                        code=code,
+                        market_code=actual_mkt,
+                        security_id=int(row[0]),
+                        route=market_route(actual_mkt),
+                        name=row[1] if row[1] else None,
+                    ))
+            return results
+        finally:
+            connection.close()
+    except sqlite3.Error:
+        return [None] * len(codes)
 
 
 @dataclass(frozen=True)
@@ -312,7 +385,9 @@ class NativeQuoteClient:
         read_frame(self.socket, timeout_seconds=self.config.read_timeout_seconds)
         self._deadline()
 
-    def query(self, security_id: int) -> tuple[Decimal, Decimal]:
+    def _send_and_read(
+        self, security_id: int, *, route: int, selectors: tuple[int, ...] = (0, 1, 2)
+    ) -> tuple[int, Frame]:
         if self.socket is None:
             raise NativeSessionError("login_required")
         if self.query_count >= self.config.max_queries:
@@ -325,10 +400,11 @@ class NativeQuoteClient:
         extend = build_extend_head(self.random_bytes(32))
         request = build_quote_request(
             security_id=security_id,
-            route=JP_ROUTE,
+            route=route,
             sequence=self.sequence,
             user_id=self.user_id,
             extend_head=extend,
+            selectors=selectors,
         )
         try:
             self.socket.sendall(request)
@@ -336,12 +412,23 @@ class NativeQuoteClient:
             raise NativeSessionError("timeout") from exc
         except OSError as exc:
             raise NativeSessionError("network_error") from exc
+        seq = self.sequence
         self.sequence += 1
         self.query_count += 1
         self.last_query_at = self.monotonic()
         frame = read_frame(self.socket, timeout_seconds=self.config.read_timeout_seconds)
         self._deadline()
+        return seq, frame
+
+    def query(self, security_id: int, *, route: int = JP_ROUTE) -> tuple[Decimal, Decimal]:
+        _, frame = self._send_and_read(security_id, route=route)
         return parse_quote_prices(frame, security_id=security_id)
+
+    def query_snapshot(
+        self, security_id: int, *, route: int = JP_ROUTE, selectors: tuple[int, ...] = (0, 3, 5)
+    ):
+        _, frame = self._send_and_read(security_id, route=route, selectors=selectors)
+        return parse_quote_snapshot(frame, security_id=security_id)
 
     def reset_cycle(self) -> None:
         self.query_count = 0
@@ -391,7 +478,9 @@ class ProxyQuoteClient:
     def login(self, packet: bytes, user_id: int) -> None:
         pass
 
-    def query(self, security_id: int) -> tuple[Decimal, Decimal]:
+    def _send_and_read(
+        self, security_id: int, *, route: int, selectors: tuple[int, ...] = (0, 1, 2)
+    ) -> tuple[int, Frame]:
         if self.socket is None:
             raise NativeSessionError("login_required")
         if self.query_count >= self.max_queries:
@@ -405,10 +494,11 @@ class ProxyQuoteClient:
         my_seq = self.sequence
         request = build_quote_request(
             security_id=security_id,
-            route=JP_ROUTE,
+            route=route,
             sequence=my_seq,
             user_id=self.user_id,
             extend_head=extend,
+            selectors=selectors,
         )
         try:
             self.socket.sendall(request)
@@ -426,7 +516,17 @@ class ProxyQuoteClient:
             sequence=my_seq,
         )
         self._deadline()
+        return my_seq, frame
+
+    def query(self, security_id: int, *, route: int = JP_ROUTE) -> tuple[Decimal, Decimal]:
+        _, frame = self._send_and_read(security_id, route=route)
         return parse_quote_prices(frame, security_id=security_id)
+
+    def query_snapshot(
+        self, security_id: int, *, route: int = JP_ROUTE, selectors: tuple[int, ...] = (0, 3, 5)
+    ):
+        _, frame = self._send_and_read(security_id, route=route, selectors=selectors)
+        return parse_quote_snapshot(frame, security_id=security_id)
 
     def reset_cycle(self) -> None:
         self.query_count = 0
