@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 PROXY_PORT = 19443
 PF_ANCHOR = "stock-moni"
+CMD_CONNIP = frozenset({0xFFE1, 0x0529, 0x4EB3})
 _IP_RE = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
 
 F3CLOGIN_PATH = (
@@ -66,6 +67,71 @@ def _is_public_ip(ip_str: str) -> bool:
         return IPv4Address(ip_str).is_global
     except ValueError:
         return False
+
+
+def extract_connip_ips(payload: bytes) -> set[str]:
+    """Parse ConnIpRsp protobuf and return server_ip values.
+
+    ConnIpRsp.items is field 3 (tag 0x1a, len-delimited).
+    Each ConnIpItem.server_ip is field 1 (tag 0x0a, len-delimited string).
+    """
+    ips: set[str] = set()
+    pos = 0
+    while pos < len(payload):
+        try:
+            tag, pos = decode_varint(payload, pos)
+        except Exception:
+            break
+        field_num, wire_type = tag >> 3, tag & 7
+        if wire_type == 0:
+            _, pos = decode_varint(payload, pos)
+        elif wire_type == 2:
+            length, pos = decode_varint(payload, pos)
+            if pos + length > len(payload):
+                break
+            if field_num == 3:
+                ips |= _parse_connip_item(payload[pos : pos + length])
+            pos += length
+        elif wire_type == 1:
+            pos += 8
+        elif wire_type == 5:
+            pos += 4
+        else:
+            break
+    return ips
+
+
+def _parse_connip_item(data: bytes) -> set[str]:
+    """Extract server_ip (field 1) from a single ConnIpItem."""
+    ips: set[str] = set()
+    pos = 0
+    while pos < len(data):
+        try:
+            tag, pos = decode_varint(data, pos)
+        except Exception:
+            break
+        field_num, wire_type = tag >> 3, tag & 7
+        if wire_type == 0:
+            _, pos = decode_varint(data, pos)
+        elif wire_type == 2:
+            length, pos = decode_varint(data, pos)
+            if pos + length > len(data):
+                break
+            if field_num == 1:
+                try:
+                    ip_str = data[pos : pos + length].decode("ascii")
+                    if _is_public_ip(ip_str):
+                        ips.add(ip_str)
+                except (UnicodeDecodeError, ValueError):
+                    pass
+            pos += length
+        elif wire_type == 1:
+            pos += 8
+        elif wire_type == 5:
+            pos += 4
+        else:
+            break
+    return ips
 
 
 # ── IP Pool Loading ───────────────────────────────────────
@@ -197,12 +263,33 @@ class _ProxyBridge:
             pass
         return self._fallback_ip
 
+    def _connect_forward(self, forward_ip: str) -> socket.socket:
+        """Connect upstream by temporarily lifting the lo0 route trap."""
+        upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            subprocess.run(
+                ["route", "delete", "-host", forward_ip],
+                capture_output=True, text=True,
+            )
+            upstream.settimeout(10)
+            upstream.connect((forward_ip, self.config.forward_port))
+            subprocess.run(
+                ["route", "add", "-host", forward_ip, "-interface", "lo0"],
+                capture_output=True, text=True,
+            )
+            return upstream
+        except Exception:
+            subprocess.run(
+                ["route", "add", "-host", forward_ip, "-interface", "lo0"],
+                capture_output=True, text=True,
+            )
+            upstream.close()
+            raise
+
     def _handle_connection(self, csock: socket.socket) -> None:
         forward_ip = self._resolve_original_dst(csock)
         try:
-            rsock = socket.create_connection(
-                (forward_ip, self.config.forward_port), timeout=10,
-            )
+            rsock = self._connect_forward(forward_ip)
         except OSError:
             csock.close()
             return
@@ -269,6 +356,16 @@ class _ProxyBridge:
                                         self._login_done.set()
                                     else:
                                         logger.warning("proxy: LOGIN rejected (0x%x)", rv)
+                            elif cmd in CMD_CONNIP:
+                                payload = bytes(buf_r[HEADER_LENGTH + ext:total])
+                                new_ips = extract_connip_ips(payload)
+                                if new_ips:
+                                    logger.info(
+                                        "ConnIpRsp cmd=0x%04X: %d IPs parsed: %s",
+                                        cmd, len(new_ips), sorted(new_ips),
+                                    )
+                                for ip in new_ips:
+                                    self._hot_add_route(ip)
                             del buf_r[:total]
                         csock.sendall(d)
                         if logged:
