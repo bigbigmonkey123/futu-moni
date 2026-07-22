@@ -2,9 +2,11 @@
 
 ## 这个项目是什么
 
-通过富途牛牛（FTNN）桌面端的原生 FT 二进制协议，持续获取日本市场 ETF 报价的服务。
+通过富途牛牛（FTNN）桌面端的原生 FT 二进制协议，获取日本市场 ETF 报价（1306/1321/1489）。
 
 **核心约束：不允许使用 OpenD。** 只走 FTNN 原生 app 的网络通道。
+
+**注意：运行本工具会强制关闭正在运行的 FTNN 进程，请确保没有在 FTNN 中进行交易操作。**
 
 ## 一键运行
 
@@ -13,27 +15,49 @@
 git clone https://github.com/bigbigmonkey123/futu-moni.git
 cd futu-moni
 
-# 2. 安装
-uv sync
-
-# 3. 前提：首次必须手动打开 FTNN 登录一次，勾选"自动登录"
-
-# 4. 运行（需要 root）
-sudo uv run python -m futu_moni.main
+# 2. 运行（自动安装依赖 + 自动申请 sudo）
+./run.sh
 ```
 
-程序会自动：加载 IP 池 → 设置路由 → 启动 FTNN → 拦截登录 → 查询报价 → 清理。
+`run.sh` 会自动：找 Python 3.11+ → 创建 venv → 安装依赖 → 申请 sudo → 启动。
+
+如果没有 `run.sh` 的执行权限：`chmod +x run.sh`
+
+### 等价的手动运行方式
+
+```bash
+# 需要 uv (安装: curl -LsSf https://astral.sh/uv/install.sh | sh)
+uv sync
+sudo uv run python -m futu_moni
+```
+
+**注意**: 入口是 `python -m futu_moni`（不是 `futu_moni.main`）。
+
+## 运行前必须做的一件事
+
+**首次使用前，必须手动打开 FTNN 登录一次：**
+
+1. 打开 `/Applications/富途牛牛.app`
+2. 输入你的富途账号密码登录
+3. **勾选「自动登录」复选框**（登录框底部）
+4. 登录成功后可以关闭 FTNN
+
+这一步是为了让 FTNN 保存自动登录 token。之后 `futu-moni` 每次运行时会自动启动 FTNN 并利用这个 token 完成登录。
+
+**如果看到 `login_rejected` 错误**，说明自动登录 token 已失效（通常是因为反复强制关闭 FTNN）。解决方法：重复上面的手动登录步骤。
 
 ## 运行前检查
 
+程序启动时会自动检查，但你也可以提前确认：
+
 ```bash
-# FTNN 已安装？
+# 1. FTNN 已安装？
 ls /Applications/富途牛牛.app
 
-# SecListDB 存在？（报价查询需要 security_id 映射）
-ls ~/.com.futunn.FutuOpenD/F3CNN/SecListDB.v13.dat
+# 2. SecListDB 存在？（至少存在 v12 或 v13）
+ls ~/.com.futunn.FutuOpenD/F3CNN/SecListDB.v1*.dat
 
-# 有 root 权限？（route/pfctl/lsof 需要）
+# 3. 有 sudo 权限？（route/pfctl/lsof 需要 root）
 sudo echo ok
 ```
 
@@ -41,35 +65,104 @@ sudo echo ok
 
 - macOS（依赖 pfctl、route、lsof 命令）
 - Python 3.11+
-- pydantic >= 2.0
 - 已安装富途牛牛（`/Applications/富途牛牛.app`）
 - **需要 root 权限**（route/PF/lsof）
+- 如果 Terminal 没有「完全磁盘访问权限」，可能无法读取 FTNN 的 SQLite 数据库
+
+## 输出示例
+
+```
+============================================================
+futu-moni: JP ETF 报价服务 (1306 / 1321 / 1489)
+============================================================
+
+[检查] 全部通过 ✓
+[启动] 预加载 IP 池, 设置路由拦截, 启动 FTNN...
+[代理] 登录成功 ✓
+[查询] 正在获取报价...
+
+  1306: last=417.1 JPY, prev_close=415.8 JPY ✓
+  1321: last=40385.0 JPY, prev_close=40210.0 JPY ✓
+  1489: last=2543.0 JPY, prev_close=2535.0 JPY ✓
+
+============================================================
+✓ 全部成功: 3/3 只 ETF 获取到报价
+  decision = CONDITIONAL_GO
+============================================================
+
+结果已写入: /path/to/futu_moni_result.json
+```
+
+## 常见错误及解决
+
+| 错误信息 | 原因 | 解决方法 |
+|----------|------|----------|
+| `需要 root 权限` | 没有 sudo | 用 `sudo ./run.sh` 或 `sudo uv run python -m futu_moni` |
+| `富途牛牛未安装` | FTNN 没装 | 安装 `/Applications/富途牛牛.app` |
+| `SecListDB 不存在` | 没有登录过 FTNN | 手动打开 FTNN 登录一次 |
+| `login_rejected` | 自动登录 token 失效 | 手动打开 FTNN 重新登录，勾选自动登录 |
+| `fresh_login_timeout` | 120秒内没有成功登录 | 检查网络；手动登录 FTNN 刷新 token |
+| `Address already in use` | 端口 19443 被占用 | `sudo lsof -i :19443` 找到并 kill 进程 |
+| `no IPs in pool` | F3CLogin 二进制不存在 | 确认 FTNN 安装完整 |
+
+## 异常退出后的手动清理
+
+如果程序被 kill -9 或崩溃，可能残留系统级配置：
+
+```bash
+# 1. 清理 PF anchor（最重要）
+sudo pfctl -a stock-moni -F all
+
+# 2. 查看残留路由
+netstat -rn | grep lo0 | grep -v "127\.\|::1\|ff"
+
+# 3. 逐个删除残留路由
+sudo route delete -host <IP>
+
+# 4. 查看并 kill 残留的 proxy 监听
+sudo lsof -i :19443
+sudo kill <PID>
+
+# 5. 如果需要，关闭 FTNN
+killall FTNN
+```
+
+## 诊断工具
+
+```bash
+# 诊断 FTNN 实际连接了哪些 IP（不会修改系统配置）
+sudo ./diagnose.sh
+```
+
+---
+
+## 以下是技术细节（开发者/Codex 参考）
 
 ## 目标证券
 
-固定查询 3 只 JP ETF，硬编码在 `models.py:TARGET_SYMBOLS`：
-
-| 代码 | security_id (SecListDB) | 路由 |
-|------|-------------------------|------|
+| 代码 | security_id | 路由 |
+|------|-------------|------|
 | 1306 | 82669546513451 | 1001 |
 | 1321 | 82669546513459 | 1001 |
 | 1489 | 82669546513559 | 1001 |
+
+security_id 来自 FTNN 本地 SQLite（SecListDB，支持 v12 和 v13）。
 
 ## 认证原理
 
 FT 协议的 LOGIN token 是**服务端一次性消耗**的——FTNN 发出后立刻失效，packet replay 永远不行。
 
-FTNN 的 FT 协议服务器 IP 是**硬编码+API 动态分配**的（不走 DNS），域名劫持、/etc/hosts、SQLite 修改均无效。
+FTNN 的 FT 服务器 IP 是**硬编码+API 动态分配**的（不走 DNS），域名劫持、/etc/hosts、SQLite 修改均无效。
 
 ### IP 解析链路（优先级从高到低）
 
 1. **F3CLogin.framework 硬编码**: ~155 个公网 IP，编译在二进制里
 2. **ConnIpRsp**: FT 协议在线 IP 分配（protobuf，cmd 0xFFE1/0x0529/0x4EB3）
 3. **云配置 confnn.futuhn.com**: 覆盖 SQLite 中的 guaranteed_ip
-4. **guaranteed_ip_for_conn**: SQLite 回退池
+4. **guaranteed_ip_for_conn**: CommonConfig.db 回退池（路径: `~/Library/Containers/cn.futu.niuniu.nx/Data/Library/Application Support/Common/CommonConfig.db`）
 5. **forced_ip_for_conn**: 功能未启用
 
-### 解决方案：v0.6 route-lift + ConnIpRsp 在代理内解析
+### 代理方案：route-lift + ConnIpRsp 在代理内解析
 
 ```
 1. 预加载 IP 池 (~159 个):
@@ -82,15 +175,13 @@ FTNN 的 FT 协议服务器 IP 是**硬编码+API 动态分配**的（不走 DNS
    pfctl -a stock-moni -f -    →  rdr on lo0 port 443 → 127.0.0.1:19443
    pfctl -e
 
-3. 启动 FTNN:
-   killall FTNN → sleep 1 → open FTNN
+3. killall FTNN → sleep 1 → open FTNN
    FTNN → connect(某个 IP:443) → lo0 → PF anchor → proxy:19443
 
 4. proxy 上游连接（route-lift）:
-   route delete -host <目标IP>        # 临时移除 trap
+   route delete -host <目标IP>        # 临时移除 trap (<100ms)
    connect(目标IP:443)                # 走默认路由直连真实服务器
    route add -host <目标IP> lo0       # 立刻恢复 trap
-   竞态窗口 <100ms，FTNN 无法在此间隙逃逸
 
 5. ConnIpRsp 在代理内解析:
    proxy 解析 server→client 帧流
@@ -107,19 +198,11 @@ FTNN 的 FT 协议服务器 IP 是**硬编码+API 动态分配**的（不走 DNS
    在 socket 上注入 INIT + QUOTE 查询
 ```
 
-### 关键技术细节
-
-- **route-lift 而非 IP_BOUND_IF**: 早期尝试用 `setsockopt(IP_BOUND_IF)` 绑定 socket 到物理网卡绕过 lo0 trap，但与 route trap 冲突（`EADDRNOTAVAIL`）。改为临时 route delete → connect → route add
-- **ConnIpRsp 解析时机**: ConnIpRsp 在已代理的 TCP 连接上传输，proxy 在转发给 FTNN 之前就解析出新 IP 并 hot-add route，时序上保证在 FTNN 使用新 IP 之前完成
-- PF **anchor** `stock-moni`（不污染全局 PF），清理用 `pfctl -a stock-moni -F all`
-- `pfctl -s state` 恢复 original destination IP（fallback 到池中第一个 IP）
-
 ## FT 二进制协议
 
 ### 传输层
 
 - **TCP 端口 443**，但**不是 TLS**——裸 TCP 上跑自定义二进制帧
-- 每个连接是全双工的，服务端会主动推 heartbeat / ConnIpPush
 
 ### 帧格式（32 字节 header + variable body）
 
@@ -147,9 +230,9 @@ FTNN 的 FT 协议服务器 IP 是**硬编码+API 动态分配**的（不走 DNS
 |------|------|------|------|
 | LOGIN | 0x1771 | 双向 | 登录请求/响应，payload 含一次性 token |
 | INIT | 0x1B0E | 双向 | 会话初始化（LOGIN 成功后必须发） |
-| QUOTE | 0x1AA8 | 双向 | 报价查询，payload 含 security_id + selectors |
-| Heartbeat | 0x1844 | 服务端→客户端 | 保活，代理/客户端需要跳过 |
-| ConnIpRsp | 0xFFE1 / 0x0529 / 0x4EB3 | 服务端→客户端 | 返回 IP 池，protobuf 编码 |
+| QUOTE | 0x1AA8 | 双向 | 报价查询 |
+| Heartbeat | 0x1844 | 服务端→客户端 | 保活 |
+| ConnIpRsp | 0xFFE1 / 0x0529 / 0x4EB3 | 服务端→客户端 | 返回 IP 池 |
 
 ### ConnIpRsp protobuf 结构
 
@@ -161,134 +244,41 @@ ConnIpRsp {
 }
 
 ConnIpItem {
-  field 1: server_ip (string)            // tag 0x0a — 我们要的
+  field 1: server_ip (string)            // tag 0x0a
   field 2: port (varint)                 // tag 0x10
-  field 3: domain (string)              // tag 0x1a
-  field 4: region (varint)              // tag 0x20
-  field 5: conn_identity (varint)       // tag 0x28 — 0x64=主通道
+  field 5: conn_identity (varint)        // tag 0x28, 0x64=主通道
 }
 ```
 
 ### Payload 编码
 
-- body = `extend_head` + `payload`
-- `extend_head`：追踪信息，含 32 字节随机数（每次请求新生成），protobuf 编码
-- `payload`：业务数据，protobuf 编码，字段用 varint tag
-- LOGIN 响应 payload：`varint(unknown) + varint(result)`，result=0 表示成功，0xFFFFFFFFFFFFFFFF 表示 busy
-- QUOTE 响应 payload：嵌套 protobuf，field 1 是 item 列表，每个 item 内 field 2 subtype=0 的子消息包含 `field1=current_price, field2=prev_close`，价格单位 nanounits（÷ 1e9 = JPY）
-
-### 序列号规则
-
-- `ProxyQuoteClient`（MITM 模式）：从 9001 开始（避免和 FTNN 自身的序列号冲突）
-- 每次请求 sequence++，响应匹配同一个 sequence
-- `read_frame_for_command()` 按 command + sequence 匹配，最多跳过 50 个不匹配的帧
-
-## 连接生命周期
-
-```
-时间线：
-──────────────────────────────────────────────────────────────────────────
-
-1. proxy 启动
-   load_ip_pool()                    → ~159 个候选 IP
-   route add -host <IP> lo0          × N 个
-   pfctl -a stock-moni               → rdr :443 → :19443
-   listen 127.0.0.1:19443
-
-2. FTNN 启动 + 自动登录
-   FTNN → connect(某个 IP:443)
-        → lo0 → PF anchor → 127.0.0.1:19443
-   proxy accept()
-   proxy → pfctl -s state           → 恢复原始目标 IP
-   proxy → route-lift connect       → 真实服务器（临时移除+恢复 route）
-
-3. 帧流透传 + ConnIpRsp 解析
-   FTNN ──各种 req──→ proxy ──────→ 服务器
-   FTNN ←─各种 rsp──← proxy ←─────← 服务器
-                       ↓
-             if ConnIpRsp: extract IPs → hot-add route
-             if LOGIN req: 记录 user_id
-             if LOGIN rsp: 解析 result
-
-4. LOGIN 成功 → Socket 交接
-   proxy 关闭 client 侧连接
-   保留 proxy↔服务器 socket → ProxySession
-   清理: route delete + pfctl -a stock-moni -F all
-
-5. 报价查询
-   ProxyQuoteClient(socket, user_id)
-   ──INIT req──→ 服务器    (seq=9001)
-   ←─INIT rsp──←
-   ──QUOTE req─→ 服务器    (seq=9002, security_id=...)
-   ←─QUOTE rsp←─           → parse_quote_prices → JPY
-```
-
-## 核心数据流
-
-```
-obtain_authenticated_session(config)           # proxy.py — 入口
-  ├── load_ip_pool()                           # F3CLogin binary + SQLite
-  │     ├── _load_f3clogin_ips()               # strings | grep IP | filter public
-  │     └── _load_guaranteed_ips()             # sqlite3 CommonConfig.db
-  └── _ProxyBridge(config, ip_pool)
-        ├── _setup_routes()                    # route add 每个 IP → lo0
-        ├── _setup_pf_anchor()                 # pfctl -a stock-moni -f -
-        ├── _lsof_monitor()                    # 后台线程, hot-add 漏网 IP
-        ├── accept_loop()                      # 监听 19443
-        ├── killall FTNN + open FTNN           # 一次启动
-        ├── _handle_connection()
-        │     ├── _resolve_original_dst()      # pfctl -s state → 原始 IP
-        │     ├── _connect_forward()           # route-lift: delete → connect → add
-        │     ├── ConnIpRsp 解析               # extract_connip_ips → hot-add route
-        │     └── LOGIN 解析                   # 成功 → ProxySession
-        └── _cleanup()                         # route delete + pfctl -a stock-moni -F all
-```
+- body = `extend_head`（追踪信息）+ `payload`（业务数据），都是 protobuf
+- LOGIN 响应：`varint(unknown) + varint(result)`，result=0 成功，0xFFFFFFFFFFFFFFFF busy
+- QUOTE 响应：嵌套 protobuf，价格单位 nanounits（÷ 1e9 = JPY）
 
 ## 文件说明
 
 | 文件 | 职责 |
 |------|------|
+| `__main__.py` | CLI 入口（`python -m futu_moni`），preflight 检查 + 单次查询 |
 | `proxy.py` | 核心代理：IP 池加载、route/PF、route-lift 连接、ConnIpRsp 解析、LOGIN 拦截 |
-| `protocol.py` | FT 二进制协议：header 解析、varint、帧读写、protobuf 价格解码 |
+| `protocol.py` | FT 二进制协议：header、varint、帧读写、protobuf 价格解码 |
 | `models.py` | Pydantic 模型，fail-closed 验证 |
 | `adapter.py` | `ProxyQuoteClient`（MITM 后查询）+ security_id 映射 |
-| `service.py` | `FutuNativeService`：主循环、重连、backoff、health 追踪 |
+| `service.py` | `FutuNativeService`：持续轮询主循环 |
+| `run.sh` | 一键启动脚本（自动找 Python、创建 venv、申请 sudo） |
+| `diagnose.sh` | 诊断 FTNN 实际连接目标（不修改系统配置） |
 
 ## 测试
 
 ```bash
-uv sync --extra test
+# 安装 pytest（项目未声明 test extra，需手动安装）
+uv sync
+uv pip install pytest
+
+# 运行测试
 uv run pytest tests/ -v
 ```
-
-## 手动清理（异常退出后）
-
-```bash
-# 清理 PF anchor
-sudo pfctl -a stock-moni -F all
-
-# 查看残留路由
-netstat -rn | grep lo0 | grep -v "127\.\|::1\|ff"
-
-# 逐个删除
-sudo route delete -host <IP>
-```
-
-## 已知坑
-
-1. **首次必须手动登录** — FTNN 需要至少登录一次才有自动登录 token
-2. **反复 killall 会导致 token 失效** — 如果 LOGIN 被 reject，需要手动重新登录 FTNN
-3. **SIGKILL 残留路由** — 用上面的手动清理命令
-4. **代理超时** — 默认 120 秒等待登录
-
-## 验证证据（2026-07-21 实机测试）
-
-1. **IP 池加载**: 159 个候选 IP（155 F3CLogin + 54 guaranteed，去重后 159）
-2. **route-lift 上游连接**: 4/4 连接全部成功（101.32.198.103, 49.51.78.82, 43.130.30.145, 124.156.124.214）
-3. **PF anchor 拦截**: FTNN 的所有 TCP:443 连接均被重定向到 proxy
-4. **LOGIN 检测**: proxy 在帧流中正确识别 LOGIN 请求并提取 user_id
-5. **ConnIpRsp 解析**: 单元测试验证 protobuf 解析、私有 IP 过滤、帧重组、多命令码识别
-6. **hot-add route**: 动态发现的 IP（43.130.30.145, 43.175.136.145, 42.193.128.62 等）在 FTNN 使用前被 trap
 
 ## stock-moni 集成
 
