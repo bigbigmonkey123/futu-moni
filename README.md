@@ -1,8 +1,10 @@
 # futu-moni
 
-通过富途牛牛桌面端获取 JP 市场 ETF 报价 (1306 / 1321 / 1489)。
+通过富途牛牛桌面端原生 FT 协议获取实时股票报价。
 
 不需要 OpenD，不需要 API key，不需要任何配置。
+
+支持 JP / HK / US 市场查询。
 
 ## 使用
 
@@ -86,13 +88,43 @@ sudo route delete -host <IP>
 sudo pfctl -d
 ```
 
-## 目标证券
+## 支持市场
 
-| 代码 | 名称 | 市场 |
-|------|------|------|
-| 1306 | NEXT FUNDS TOPIX ETF | JP |
-| 1321 | Nikkei 225 ETF | JP |
-| 1489 | NF 日経高配当50 ETF | JP |
+| 市场 | market_code | route | 示例 |
+|------|-------------|-------|------|
+| HK | 1 | 1 | 9988 (阿里巴巴), 00700 (腾讯) |
+| US Stock | 11 | 11 | AAPL, MSFT, GOOGL |
+| US ETF | 12 | 12 | SPY, QQQ |
+| JP | 830 | 1001 | 1306, 1321, 1489 |
+
+默认目标证券: 1306 / 1321 / 1489 (JP ETF)
+
+## FT 协议能力
+
+原生 FTNN 服务器 ≠ OpenD/OpenAPI。相同帧格式，不同命令集。
+
+**可用数据 (CMD_QUOTE 0x1AA8 selector)**:
+
+| Selector | 数据 | 说明 |
+|----------|------|------|
+| 0 | 实时价格 | last, prev_close, timestamp |
+| 1 | 市场状态 | 交易状态 |
+| 3 | 盘口 | HK 10档, US/JP 1档 |
+| 5 | OHLCV | 开高低收量+成交额 |
+| 8 | 基本面 | PE, 市值 |
+| 12 | 盘前盘后 | US 市场 |
+
+**不可用**: 逐笔成交、分时、历史K线、复权、ETF iNAV (OpenAPI 命令被拒绝)
+
+## 诊断工具
+
+```bash
+# 探测所有 selector 的响应形状 (sanitized, 不泄露原始数据)
+sudo python experiments/ft_selector_probe.py --all-symbols-key
+
+# 探测不同市场的价格
+sudo python experiments/ft_market_probe.py
+```
 
 ## 已知限制
 
@@ -100,6 +132,7 @@ sudo pfctl -d
 - 需要 root 权限 (route/pfctl + lsof)
 - 需要 FTNN 开启自动登录才能全自动
 - FTNN 崩溃后需重新运行
+- Security_id 通过本地 SecListDB 解析 (FTNN 自动维护)
 
 ## License
 

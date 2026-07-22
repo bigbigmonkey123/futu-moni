@@ -7,7 +7,7 @@ MITM proxy that intercepts FTNN (富途牛牛) desktop app's native FT binary pr
 ```bash
 uv sync                        # install deps
 uv pip install pytest          # no test extra declared
-uv run pytest tests/ -v        # run all tests (19 tests, no root needed)
+uv run pytest tests/ -v        # run all tests (28 tests, no root needed)
 ```
 
 Entry point: `python -m futu_moni` (NOT `futu_moni.main`). Requires root.
@@ -157,6 +157,8 @@ LOGIN redirect response example (field 5 = "49.51.78.83", field 6 = 443):
 |------|------|------|
 | `proxy.py` | Core: IP pool, route/PF setup, route-lift connect, ConnIpRsp parser, LOGIN redirect, passthrough, lsof monitor | HIGH — system-level changes |
 | `protocol.py` | FT binary: header build/parse, varint, frame read/write, quote price decode | HIGH — one byte offset breaks everything |
+| `experiments/ft_market_probe.py` | Sanitized read-only selector 0/1/2 shape probe; never emits opaque payload/account material | MEDIUM |
+| `experiments/ft_selector_probe.py` | Sanitized read-only selector inventory; `--all-symbols-key` verifies selectors 0/3/4/5/6/7/8 for all targets | MEDIUM |
 | `adapter.py` | `ProxyQuoteClient` (post-MITM queries), security_id resolution from SecListDB | MEDIUM |
 | `models.py` | Pydantic models, fail-closed validation (decision must match evidence) | MEDIUM |
 | `service.py` | `FutuNativeService`: polling loop, reconnect, backoff, health tracking | LOW |
@@ -182,6 +184,8 @@ protocol.py:
   read_frame(sock) → Frame
   read_frame_for_command(sock, cmd, seq) → Frame    # skips heartbeats
   parse_quote_prices(frame, security_id) → (Decimal, Decimal)
+  inspect_quote_response(frame, security_id) → tuple[QuoteSubtypeInspection, ...]
+  build_quote_request(..., selectors=(...)) → bytes  # known read-only selectors only
 
 adapter.py:
   ProxyQuoteClient(socket, user_id)
@@ -205,9 +209,16 @@ TARGET_SYMBOLS = ["1306", "1321", "1489"]
 
 ## Tests
 
-19 tests total, all pure unit tests (no root, no network, no FTNN):
+28 tests total, all pure unit tests (no root, no network, no FTNN):
 - `test_proxy.py` (8): route-lift mock, ConnIpRsp protobuf parsing, IP filtering, malformed input
 - `test_futu_native_service.py` (11): service lifecycle, backoff, reconnect, health tracking
+- `test_protocol_inspection.py` (9): sanitized shape inspection, malformed/missing fail-closed, uint64/group handling, selector allowlist
+
+Phase A evidence and the complete capability matrix are under
+`.codex-shared/evidence-market-fields/`. Only `last`/`prev_close` remain in the
+production model; newly mapped fields are diagnostic evidence until a separate
+Phase B contract is approved. `market_as_of`, NAV/iNAV, and premium-discount
+remain unqualified and must not be inferred.
 
 ## Approaches That Failed (don't retry)
 
