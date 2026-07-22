@@ -223,6 +223,36 @@ class _ProxyBridge:
             return True
         return False
 
+    def _hot_add_login_redirect_ips(self, payload: bytes) -> None:
+        """Parse LOGIN rejection response protobuf for redirect server IPs."""
+        pos = 0
+        while pos < len(payload):
+            try:
+                tag, pos = decode_varint(payload, pos)
+            except Exception:
+                break
+            wire_type = tag & 7
+            if wire_type == 0:
+                _, pos = decode_varint(payload, pos)
+            elif wire_type == 2:
+                length, pos = decode_varint(payload, pos)
+                if pos + length > len(payload):
+                    break
+                try:
+                    candidate = payload[pos : pos + length].decode("ascii")
+                    if _is_public_ip(candidate):
+                        if self._hot_add_route(candidate):
+                            logger.info("hot-added route for LOGIN redirect IP: %s", candidate)
+                except (UnicodeDecodeError, ValueError):
+                    pass
+                pos += length
+            elif wire_type == 1:
+                pos += 8
+            elif wire_type == 5:
+                pos += 4
+            else:
+                break
+
     def _setup_pf_anchor(self) -> None:
         rule = (
             f"rdr pass on lo0 proto tcp from any to any port 443 "
@@ -288,16 +318,20 @@ class _ProxyBridge:
 
     def _handle_connection(self, csock: socket.socket) -> None:
         forward_ip = self._resolve_original_dst(csock)
+        logger.info("proxy: accepted connection, forward_ip=%s", forward_ip)
         try:
             rsock = self._connect_forward(forward_ip)
         except OSError:
             csock.close()
             return
+        logger.info("proxy: upstream connected to %s:%d", forward_ip, self.config.forward_port)
 
         uid = None
         logged = False
         buf_c = bytearray()
         buf_r = bytearray()
+        passthrough_c = False
+        passthrough_r = False
 
         try:
             while not self._stop.is_set():
@@ -307,66 +341,77 @@ class _ProxyBridge:
                         d = csock.recv(65536)
                         if not d:
                             return
-                        buf_c.extend(d)
-                        while True:
-                            if len(buf_c) < HEADER_LENGTH:
-                                break
-                            if buf_c[:2] != b"FT":
-                                break
-                            bl = struct.unpack(">I", buf_c[18:22])[0]
-                            if bl > MAX_BODY_LENGTH:
-                                break
-                            total = HEADER_LENGTH + bl
-                            if len(buf_c) < total:
-                                break
-                            cmd = struct.unpack(">H", buf_c[16:18])[0]
-                            if cmd == CMD_LOGIN:
-                                uid = struct.unpack(">I", buf_c[8:12])[0] >> 8
-                                logger.debug("proxy: LOGIN detected")
-                            del buf_c[:total]
+                        if not passthrough_c:
+                            buf_c.extend(d)
+                            while True:
+                                if len(buf_c) < HEADER_LENGTH:
+                                    break
+                                if buf_c[:2] != b"FT":
+                                    passthrough_c = True
+                                    buf_c.clear()
+                                    break
+                                bl = struct.unpack(">I", buf_c[18:22])[0]
+                                if bl > MAX_BODY_LENGTH:
+                                    passthrough_c = True
+                                    buf_c.clear()
+                                    break
+                                total = HEADER_LENGTH + bl
+                                if len(buf_c) < total:
+                                    break
+                                cmd = struct.unpack(">H", buf_c[16:18])[0]
+                                if cmd == CMD_LOGIN:
+                                    uid = struct.unpack(">I", buf_c[8:12])[0] >> 8
+                                    logger.debug("proxy: LOGIN detected")
+                                del buf_c[:total]
                         rsock.sendall(d)
                     elif s is rsock:
                         d = rsock.recv(65536)
                         if not d:
                             return
-                        buf_r.extend(d)
-                        while True:
-                            if len(buf_r) < HEADER_LENGTH:
-                                break
-                            if buf_r[:2] != b"FT":
-                                break
-                            bl = struct.unpack(">I", buf_r[18:22])[0]
-                            ext = struct.unpack(">H", buf_r[30:32])[0]
-                            if bl > MAX_BODY_LENGTH:
-                                break
-                            total = HEADER_LENGTH + bl
-                            if len(buf_r) < total:
-                                break
-                            cmd = struct.unpack(">H", buf_r[16:18])[0]
-                            if cmd == CMD_LOGIN and uid:
-                                payload = bytes(buf_r[HEADER_LENGTH + ext:total])
-                                if len(payload) >= 2:
-                                    _, p = decode_varint(payload, 0)
-                                    rv, _ = decode_varint(payload, p)
-                                    if rv == 0:
-                                        logged = True
-                                        with self._lock:
-                                            self._session = ProxySession(socket=rsock, user_id=uid)
-                                        logger.info("proxy: LOGIN success")
-                                        self._login_done.set()
-                                    else:
-                                        logger.warning("proxy: LOGIN rejected (0x%x)", rv)
-                            elif cmd in CMD_CONNIP:
-                                payload = bytes(buf_r[HEADER_LENGTH + ext:total])
-                                new_ips = extract_connip_ips(payload)
-                                if new_ips:
-                                    logger.info(
-                                        "ConnIpRsp cmd=0x%04X: %d IPs parsed: %s",
-                                        cmd, len(new_ips), sorted(new_ips),
-                                    )
-                                for ip in new_ips:
-                                    self._hot_add_route(ip)
-                            del buf_r[:total]
+                        if not passthrough_r:
+                            buf_r.extend(d)
+                            while True:
+                                if len(buf_r) < HEADER_LENGTH:
+                                    break
+                                if buf_r[:2] != b"FT":
+                                    passthrough_r = True
+                                    buf_r.clear()
+                                    break
+                                bl = struct.unpack(">I", buf_r[18:22])[0]
+                                ext = struct.unpack(">H", buf_r[30:32])[0]
+                                if bl > MAX_BODY_LENGTH:
+                                    passthrough_r = True
+                                    buf_r.clear()
+                                    break
+                                total = HEADER_LENGTH + bl
+                                if len(buf_r) < total:
+                                    break
+                                cmd = struct.unpack(">H", buf_r[16:18])[0]
+                                if cmd == CMD_LOGIN and uid:
+                                    payload = bytes(buf_r[HEADER_LENGTH + ext:total])
+                                    if len(payload) >= 2:
+                                        _, p = decode_varint(payload, 0)
+                                        rv, _ = decode_varint(payload, p)
+                                        if rv == 0:
+                                            logged = True
+                                            with self._lock:
+                                                self._session = ProxySession(socket=rsock, user_id=uid)
+                                            logger.info("proxy: LOGIN success")
+                                            self._login_done.set()
+                                        else:
+                                            logger.info("proxy: LOGIN rejected on %s, waiting for retry on other server", forward_ip)
+                                            self._hot_add_login_redirect_ips(payload)
+                                elif cmd in CMD_CONNIP:
+                                    payload = bytes(buf_r[HEADER_LENGTH + ext:total])
+                                    new_ips = extract_connip_ips(payload)
+                                    if new_ips:
+                                        logger.info(
+                                            "ConnIpRsp cmd=0x%04X: %d IPs parsed: %s",
+                                            cmd, len(new_ips), sorted(new_ips),
+                                        )
+                                    for ip in new_ips:
+                                        self._hot_add_route(ip)
+                                del buf_r[:total]
                         csock.sendall(d)
                         if logged:
                             csock.close()
@@ -428,9 +473,18 @@ class _ProxyBridge:
         monitor_thread = threading.Thread(target=self._lsof_monitor, daemon=True)
         monitor_thread.start()
 
-        subprocess.run(["killall", "FTNN"], capture_output=True)
-        time.sleep(1)
-        subprocess.Popen(["open", "/Applications/富途牛牛.app"])
+        subprocess.run(["killall", "FTNN"], capture_output=True, text=True)
+        for _ in range(20):
+            r = subprocess.run(
+                ["pgrep", "-x", "FTNN"], capture_output=True, text=True,
+            )
+            if r.returncode != 0:
+                break
+            time.sleep(0.5)
+        else:
+            subprocess.run(["killall", "-9", "FTNN"], capture_output=True, text=True)
+            time.sleep(1)
+        subprocess.run(["open", "-a", "/Applications/富途牛牛.app"], capture_output=True, text=True)
         logger.info("FTNN launched, waiting for auto-login...")
 
         self._login_done.wait(timeout=self.config.login_timeout_seconds)
