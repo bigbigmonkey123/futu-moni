@@ -12,6 +12,13 @@ FT 协议 MITM 代理的迭代过程，从失败到成功。
 | `ft_full_proxy.py` | lo0 IP 别名 (扩展 22 IP) | 同样的 accept() bug |
 | **`ft_pf_proxy.py`** | **PF rdr + route (最终方案)** | **成功: 9/9 报价, 3 轮全通过** |
 
+## 诊断工具
+
+| 脚本 | 用途 |
+|------|------|
+| `ft_market_probe.py` | 不同市场的 selector 0/1/2 响应形状探测 (sanitized) |
+| `ft_selector_probe.py` | 完整 selector inventory; `--all-symbols-key` 验证 0/3/4/5/6/7/8 |
+
 ## 关键发现
 
 - FT LOGIN token 是一次性的，packet replay 永远不行

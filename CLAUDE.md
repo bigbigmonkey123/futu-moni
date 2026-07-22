@@ -1,6 +1,6 @@
 # futu-moni
 
-MITM proxy that intercepts FTNN (富途牛牛) desktop app's native FT binary protocol to obtain JP ETF quotes (1306, 1321, 1489). **No OpenD allowed — native app only.**
+MITM proxy that intercepts FTNN (富途牛牛) desktop app's native FT binary protocol to obtain real-time stock quotes across JP/HK/US markets. **No OpenD allowed — native app only.**
 
 ## Quick Start (Development)
 
@@ -156,13 +156,26 @@ LOGIN redirect response example (field 5 = "49.51.78.83", field 6 = 443):
 | File | Role | Risk |
 |------|------|------|
 | `proxy.py` | Core: IP pool, route/PF setup, route-lift connect, ConnIpRsp parser, LOGIN redirect, passthrough, lsof monitor | HIGH — system-level changes |
-| `protocol.py` | FT binary: header build/parse, varint, frame read/write, quote price decode | HIGH — one byte offset breaks everything |
-| `experiments/ft_market_probe.py` | Sanitized read-only selector 0/1/2 shape probe; never emits opaque payload/account material | MEDIUM |
-| `experiments/ft_selector_probe.py` | Sanitized read-only selector inventory; `--all-symbols-key` verifies selectors 0/3/4/5/6/7/8 for all targets | MEDIUM |
-| `adapter.py` | `ProxyQuoteClient` (post-MITM queries), security_id resolution from SecListDB | MEDIUM |
-| `models.py` | Pydantic models, fail-closed validation (decision must match evidence) | MEDIUM |
-| `service.py` | `FutuNativeService`: polling loop, reconnect, backoff, health tracking | LOW |
-| `__main__.py` | CLI entry, preflight checks, one-shot query | LOW |
+| `protocol.py` | FT binary: header build/parse, varint, frame read/write, quote price/snapshot decode, lenient protobuf parser | HIGH — one byte offset breaks everything |
+| `adapter.py` | `ProxyQuoteClient` + `NativeQuoteClient` (post-MITM queries), multi-market security resolver, JP-specific resolver, report assembly | MEDIUM |
+| `models.py` | Pydantic models: `QuoteObservation`, `QuoteSnapshot` (PriceData/OrderBookData/OhlcvData/FinancialData), fail-closed validation | MEDIUM |
+| `service.py` | `FutuNativeService`: polling loop, reconnect, backoff, health tracking; dual mode (packet replay + proxy MITM) | LOW |
+| `__main__.py` | CLI entry: default JP mode (no args) + multi-market mode (`MARKET:CODE` args) | LOW |
+| `experiments/ft_market_probe.py` | Sanitized read-only selector 0/1/2 shape probe | MEDIUM |
+| `experiments/ft_selector_probe.py` | Sanitized read-only selector inventory; `--all-symbols-key` verifies selectors 0/3/4/5/6/7/8 | MEDIUM |
+
+## Data Models
+
+```
+QuoteObservation     — legacy single-quote result (last, prev_close, unit, status)
+QuoteSnapshot        — multi-selector result:
+  ├── PriceData      — last, prev_close, timestamp_ms (selector 0)
+  ├── OrderBookData  — bids[], asks[] of OrderBookLevel(price, volume) (selector 3)
+  ├── OhlcvData      — open, high, low, volume, turnover (selector 5)
+  └── FinancialData  — pe_raw, market_cap_raw (selector 8, raw varint)
+```
+
+All price fields ÷ 1e9 (nanounits), turnover ÷ 1e3. Missing fields → None, malformed → NativeSessionError.
 
 ## Key Functions
 
@@ -172,26 +185,43 @@ proxy.py:
   extract_connip_ips(payload) → set[str]            # parse ConnIpRsp protobuf
   _ProxyBridge._connect_forward(ip) → socket        # route-lift: delete→connect→add
   _ProxyBridge._hot_add_route(ip) → bool            # add lo0 route for new IP
-  _ProxyBridge._hot_add_login_redirect_ips(payload)  # parse LOGIN redirect protobuf, hot-add route
-  _ProxyBridge._handle_connection(sock)              # bidirectional proxy with frame parsing + passthrough
-  _ProxyBridge.intercept_login() → ProxySession|None # full lifecycle
-  obtain_authenticated_session(config) → ProxySession|None  # top-level entry
+  _ProxyBridge._hot_add_login_redirect_ips(payload)  # parse LOGIN redirect, hot-add route
+  _ProxyBridge._handle_connection(sock)              # bidirectional proxy + passthrough
+  _ProxyBridge.intercept_login() → ProxySession|None
+  obtain_authenticated_session(config) → ProxySession|None
 
 protocol.py:
   build_header(cmd, body_len, seq, uid, ext) → bytes
-  encode_varint(value) → bytes
-  decode_varint(data, pos) → (value, new_pos)
+  encode_varint / decode_varint                     # varint codec
   read_frame(sock) → Frame
-  read_frame_for_command(sock, cmd, seq) → Frame    # skips heartbeats
-  parse_quote_prices(frame, security_id) → (Decimal, Decimal)
+  read_frame_for_command(sock, cmd, seq) → Frame    # skips non-matching frames (heartbeats, pushes)
+  parse_quote_prices(frame, security_id) → (Decimal, Decimal)   # legacy single-price
+  parse_quote_snapshot(frame, security_id) → QuoteSnapshot      # multi-selector snapshot
   inspect_quote_response(frame, security_id) → tuple[QuoteSubtypeInspection, ...]
-  build_quote_request(..., selectors=(...)) → bytes  # known read-only selectors only
+  build_quote_request(..., selectors=(...)) → bytes
+  _protobuf_fields_lenient(data) → list             # fault-tolerant protobuf parser (HK prefix handling)
+  _find_security_item(payload, security_id) → bytes # structural + byte-search fallback
 
 adapter.py:
-  ProxyQuoteClient(socket, user_id)
-  ProxyQuoteClient.query(security_id) → (last, prev_close)
-  resolve_jp_securities(paths) → (SecListResult, list[ResolvedSecurity])
+  resolve_securities(codes, paths) → list[ResolvedSecurity | None]  # multi-market (HK/US/JP)
+  resolve_jp_securities(paths) → (SecListMetadata, list[_ResolvedSecurity])  # JP-only legacy
+  ProxyQuoteClient(socket, user_id, max_queries, total_deadline_seconds)
+  ProxyQuoteClient.query(security_id, *, route) → (last, prev_close)
+  ProxyQuoteClient.query_snapshot(security_id, *, route) → QuoteSnapshot
+  NativeQuoteClient — packet-replay client (login, query, query_snapshot, reset_cycle)
+  market_route(market_code) → int                   # ROUTE_OVERRIDES lookup
 ```
+
+## Multi-Market Support
+
+```python
+MARKET_ALIASES = {"HK": 1, "US": 11, "JP": 830}      # CLI aliases
+ROUTE_OVERRIDES = {830: 1001}                          # market_code → route
+MARKET_GROUPS = {11: (11, 12, 13)}                     # US stock/ETF/OTC grouped
+```
+
+HK codes auto-padded: `9988` → `09988` in SecListDB lookup.
+CLI usage: `sudo python3 -m futu_moni US:AAPL HK:9988 JP:1306`
 
 ## Constants
 
@@ -205,6 +235,8 @@ CMD_CONNIP = frozenset({0xFFE1, 0x0529, 0x4EB3})
 HEADER_LENGTH = 32
 MAX_BODY_LENGTH = 1024 * 1024
 TARGET_SYMBOLS = ["1306", "1321", "1489"]
+NANO_SCALE = Decimal(1_000_000_000)
+MILLI_SCALE = Decimal(1_000)
 ```
 
 ## Tests
@@ -229,6 +261,19 @@ TARGET_SYMBOLS = ["1306", "1321", "1489"]
 | Treat LOGIN result≠0 as final failure | FTNN uses result=1 as redirect — needs retry on redirect server |
 | Regex IP extraction from LOGIN payload | Word boundary `\b` matches across protobuf field boundaries (e.g. "49.51.78.830") |
 
+## Known Limitations
+
+- **HK OHLCV/orderbook**: HK responses have a 6-byte non-protobuf prefix that truncates the payload. Only price data (selector 0) and partial orderbook (selector 3) are extracted. OHLCV (selector 5) is truncated away. US and JP return full data.
+- **HK orderbook display**: HK orderbook data (355 bytes, wire type 3 groups) is extracted but may not yield individual bid/ask entries in CLI output.
+
+## Exports (`__init__.py`)
+
+```python
+FutuNativeConfig, FutuNativeReport, FutuNativeService, ProxyConfig,
+ProxyQuoteClient, ProxySession, QuoteSnapshot, ResolvedSecurity,
+ServiceConfig, ServiceHealth, ServiceState, resolve_securities
+```
+
 ## stock-moni Integration
 
 Production code at `stock-moni/src/stock_moni/observations/futu_native_app_session/`. Differences from this repo:
@@ -236,4 +281,5 @@ Production code at `stock-moni/src/stock_moni/observations/futu_native_app_sessi
 - `_FrameStream` class (vs inline buffer parsing)
 - State file v4 (mode-0600, owner identity, `cleanup_stale_state`)
 - `run_command` injection for testability
-- CLI: `uv run stock-moni futu-native-serve`
+- CLI: `uv run stock-moni poc futu-native-quote US:AAPL HK:00700 JP:1306`
+- CLI: `uv run stock-moni poc futu-native-serve` / `futu-native-check` / `futu-native-query` / `futu-native-cleanup`

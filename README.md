@@ -23,61 +23,63 @@ cd futu-moni
 ## 原理
 
 ```
-阶段 1 — 发现:
-  启动 FTNN → lsof 采集所有 port 443 连接 → 记录 IP → 关闭 FTNN
-
-阶段 2 — 拦截:
-  route add IP → lo0  ─┐
-  pfctl rdr :443 → :19443 ─┤
-  启动代理 (:19443)        │
-  重启 FTNN (自动登录)  ────┘ → FTNN ──→ lo0 ──→ PF ──→ 代理 ──→ 真实服务器
-  登录成功后: 清除 route/PF, 在连接上查询报价
+1. 预加载 IP 池 (~159 IPs): F3CLogin.framework + CommonConfig.db
+2. route add IP → lo0  ─┐
+   pfctl rdr :443 → :19443 ─┤
+   启动代理 (:19443)        │
+   启动 FTNN (自动登录)  ───┘ → FTNN ──→ lo0 ──→ PF ──→ 代理 ──→ 真实服务器
+3. 代理在线解析 ConnIpRsp，热添加新 IP 路由
+4. LOGIN 成功后: 清除 route/PF, 在保留连接上查询报价
 ```
 
 FTNN 的 FT 协议服务器 IP 是动态分配的（通过 API 获取，不走 DNS），
-所以必须先让 FTNN 连一次来发现 IP，再路由拦截。
+通过预加载 + 在线解析双重覆盖。
 
 ## 输出示例
 
+**默认 JP 模式** (`sudo python3 -m futu_moni`):
+
 ```
-============================================================
-futu-moni: JP ETF 报价服务 (1306 / 1321 / 1489)
-============================================================
-
-[阶段1] 启动 FTNN 发现服务器 IP...
-  discovered: 43.153.233.15
-  discovered: 43.153.233.166
-  discovered: 47.242.25.150
-
-[阶段2] 3 IPs routed, forward=43.153.233.15, proxy=:19443
-  FTNN relaunched, waiting for auto-login...
-  LOGIN success ✓
-
+[检查] 全部通过 ✓
+[启动] 预加载 IP 池, 设置路由拦截, 启动 FTNN...
+[代理] 登录成功 ✓
 [查询] 正在获取报价...
 
-  1306: last=417.1 JPY, prev_close=415.8 JPY ✓
-  1321: last=41250.0 JPY, prev_close=41100.0 JPY ✓
-  1489: last=2350.5 JPY, prev_close=2340.0 JPY ✓
-
-============================================================
-✓ 全部成功: 3/3 只 ETF 获取到报价
-  decision = CONDITIONAL_GO
-============================================================
+  1306: last=420.3 prev=418.3 chg=+0.48%
+        O=421.6 H=424.1 L=419.5 Vol=33.9M Bid=420.1 Ask=420.3
+  1321: last=68310 prev=68450 chg=-0.20%
+        O=69650 H=69920 L=68210 Vol=331.2K Bid=68310 Ask=68320
 ```
+
+**多市场模式** (`sudo python3 -m futu_moni US:AAPL HK:9988 JP:1306`):
+
+```
+[解析] 3 个证券待查询
+  ✓ AAPL → id=205189 route=11 Apple
+  ✓ 9988 → id=78224239372036 route=1 BABA-W
+  ✓ 1306 → id=82669546513451 route=1001 NEXT FUNDS TOPIX ETF
+
+[代理] 登录成功 ✓
+[查询] 正在获取报价...
+
+  AAPL: last=327.7 prev=326.6 chg=+0.35%
+        O=323.1 H=329.6 L=322.2 Vol=41.3M Bid=327.4 Ask=327.8
+  9988: last=113.6 prev=117.0 chg=-2.91%
+  1306: last=420.3 prev=418.3 chg=+0.48%
+        O=421.6 H=424.1 L=419.5 Vol=33.9M Bid=420.1 Ask=420.3
+```
+
+HK 仅显示价格（OHLCV/盘口因协议前缀截断暂不可用）。
 
 ## 常见问题
 
 **FTNN 自动登录失败**
 首次使用必须手动登录。登录时勾选"自动登录"，之后的查询不需要手动操作。
 
-**Phase 1 没发现任何 IP**
-- FTNN 可能被防火墙阻止
-- 检查网络连接
-- 增加发现时间: `ProxyConfig(discovery_seconds=60)`
-
-**Phase 2 超时**
+**登录超时**
 - FTNN 自动登录 token 可能已过期，需要手动重新登录
 - 确认没有其他 PF 规则冲突: `sudo pfctl -sr`
+- 调整超时: `ProxyConfig(login_timeout_seconds=90)`
 
 **异常退出后路由残留**
 ```bash
