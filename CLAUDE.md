@@ -193,8 +193,8 @@ proxy.py:
 protocol.py:
   build_header(cmd, body_len, seq, uid, ext) → bytes
   encode_varint / decode_varint                     # varint codec
-  read_frame(sock) → Frame
-  read_frame_for_command(sock, cmd, seq) → Frame    # skips non-matching frames (heartbeats, pushes)
+  read_frame(sock, *, timeout_seconds) → Frame
+  read_frame_for_command(sock, *, timeout_seconds, command, sequence) → Frame  # skips non-matching frames
   parse_quote_prices(frame, security_id) → (Decimal, Decimal)   # legacy single-price
   parse_quote_snapshot(frame, security_id) → QuoteSnapshot      # multi-selector snapshot
   inspect_quote_response(frame, security_id) → tuple[QuoteSubtypeInspection, ...]
@@ -234,7 +234,7 @@ CMD_QUOTE = 0x1AA8
 CMD_CONNIP = frozenset({0xFFE1, 0x0529, 0x4EB3})
 HEADER_LENGTH = 32
 MAX_BODY_LENGTH = 1024 * 1024
-TARGET_SYMBOLS = ["1306", "1321", "1489"]
+TARGET_SYMBOLS = ("1306", "1321", "1489")
 NANO_SCALE = Decimal(1_000_000_000)
 MILLI_SCALE = Decimal(1_000)
 ```

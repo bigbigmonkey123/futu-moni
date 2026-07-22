@@ -97,6 +97,7 @@ sudo pfctl -d
 | HK | 1 | 1 | 9988 (阿里巴巴), 00700 (腾讯) |
 | US Stock | 11 | 11 | AAPL, MSFT, GOOGL |
 | US ETF | 12 | 12 | SPY, QQQ |
+| US OTC | 13 | 13 | (via US: alias 自动搜索 11/12/13) |
 | JP | 830 | 1001 | 1306, 1321, 1489 |
 
 默认目标证券: 1306 / 1321 / 1489 (JP ETF)
