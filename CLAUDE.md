@@ -20,7 +20,7 @@ Entry point: `python -m futu_moni` (NOT `futu_moni.main`). Requires root.
 - **Root required** — route/pfctl/lsof need root privileges
 - **macOS only** — depends on pfctl, route, lsof
 
-## Architecture (v0.6: route-lift + ConnIpRsp in-proxy parsing)
+## Architecture (v0.7: route-lift + ConnIpRsp + LOGIN redirect + passthrough)
 
 ```
                     FTNN                          Real Server
@@ -57,11 +57,11 @@ Entry point: `python -m futu_moni` (NOT `futu_moni.main`). Requires root.
 1. **Load IP pool** (~159 IPs): `strings F3CLogin.framework` (~155) + `sqlite3 CommonConfig.db guaranteed_ip_for_conn` (~54), deduped
 2. **Route trap**: `route add -host <IP> -interface lo0` for each IP
 3. **PF anchor**: `pfctl -a stock-moni -f -` → `rdr pass on lo0 proto tcp from any to any port 443 -> 127.0.0.1 port 19443`
-4. **Launch FTNN**: `killall FTNN; sleep 1; open /Applications/富途牛牛.app`
-5. **Accept connection**: FTNN → lo0 → PF → proxy:19443
+4. **Launch FTNN**: `killall FTNN` + pgrep polling (up to 10s, SIGKILL fallback) + `open -a /Applications/富途牛牛.app`
+5. **Accept connection**: FTNN → lo0 → PF → proxy:19443. Non-FT connections (TLS/HTTPS) auto-switch to passthrough mode
 6. **Route-lift upstream connect**: `route delete -host <IP>` → `socket.connect(IP:443)` → `route add -host <IP> -interface lo0` (race window <100ms)
 7. **Parse response frames**: if `command ∈ CMD_CONNIP {0xFFE1, 0x0529, 0x4EB3}` → `extract_connip_ips(payload)` → `_hot_add_route(ip)`
-8. **LOGIN intercept**: detect LOGIN request (extract user_id from header[8:12]>>8), detect LOGIN response (result varint in payload), result==0 → success
+8. **LOGIN intercept**: detect LOGIN request (extract user_id from header[8:12]>>8), detect LOGIN response. result==0 → success. result==1 → redirect: parse redirect IP from response protobuf, hot-add route, wait for FTNN to retry on redirect server
 9. **Socket handoff**: close client side, keep proxy↔server socket as `ProxySession`
 10. **Cleanup**: delete all routes + `pfctl -a stock-moni -F all`
 11. **Query**: `ProxyQuoteClient` sends INIT + QUOTE on the kept socket, sequence starts at 9001
@@ -73,6 +73,14 @@ Earlier approach used `setsockopt(IP_BOUND_IF=25)` to bind upstream socket to ph
 ### Why ConnIpRsp in-proxy parsing (not just lsof)
 
 lsof runs every 3s. ConnIpRsp tells FTNN about new server IPs. If FTNN connects to a new IP before lsof discovers it, the connection bypasses the trap. In-proxy parsing sees ConnIpRsp frames **before** forwarding them to FTNN, so routes are added before FTNN can use the IPs.
+
+### Why passthrough mode for non-FT connections
+
+FTNN opens both FT binary (port 443, no TLS) and TLS/HTTPS connections to the same IPs. v0.6 crashed on non-FT data (`framing_error`), killing the connection thread **before** `sendall` could forward the data — breaking FTNN's TLS connections entirely. v0.7 detects non-FT magic bytes and switches to transparent forwarding.
+
+### Why LOGIN redirect handling
+
+LOGIN result=1 means "redirect to another server" (the response contains a redirect IP in a protobuf string field). v0.6 treated any non-zero result as final failure. v0.7 parses the redirect IP from the response protobuf, hot-adds a route **before** forwarding the response to FTNN, then waits for FTNN to retry LOGIN on the redirect server.
 
 ## FT Binary Protocol
 
@@ -99,7 +107,7 @@ Offset  Size  Field            Notes
 
 | Command | Code | Direction | Notes |
 |---------|------|-----------|-------|
-| LOGIN | 0x1771 | bidirectional | one-time token, result: 0=ok, 0xFFFFFFFFFFFFFFFF=busy |
+| LOGIN | 0x1771 | bidirectional | one-time token, result: 0=ok, 1=redirect (contains IP), 0xFFFFFFFFFFFFFFFF=busy |
 | INIT | 0x1B0E | bidirectional | must send after LOGIN success |
 | QUOTE | 0x1AA8 | bidirectional | security_id + selectors → prices in nanounits (÷1e9=JPY) |
 | Heartbeat | 0x1844 | server→client | skip when reading |
@@ -122,11 +130,17 @@ ConnIpItem:
 ### LOGIN response payload
 
 ```python
-_, pos = decode_varint(payload, 0)   # skip unknown field
+_, pos = decode_varint(payload, 0)   # field tag (0x08)
 result, _ = decode_varint(payload, pos)
 # result == 0 → LOGIN_OK
+# result == 1 → LOGIN_REDIRECT (field 5 = redirect server IP string)
 # result == 0xFFFFFFFFFFFFFFFF → LOGIN_BUSY
 # other → LOGIN_REJECTED
+```
+
+LOGIN redirect response example (field 5 = "49.51.78.83", field 6 = 443):
+```
+08 01 2a 0b "49.51.78.83" 30 bb03 40 01 50 00
 ```
 
 ## IP Resolution Chain (priority high→low)
@@ -141,7 +155,7 @@ result, _ = decode_varint(payload, pos)
 
 | File | Role | Risk |
 |------|------|------|
-| `proxy.py` | Core: IP pool, route/PF setup, route-lift connect, ConnIpRsp parser, LOGIN intercept, lsof monitor | HIGH — system-level changes |
+| `proxy.py` | Core: IP pool, route/PF setup, route-lift connect, ConnIpRsp parser, LOGIN redirect, passthrough, lsof monitor | HIGH — system-level changes |
 | `protocol.py` | FT binary: header build/parse, varint, frame read/write, quote price decode | HIGH — one byte offset breaks everything |
 | `adapter.py` | `ProxyQuoteClient` (post-MITM queries), security_id resolution from SecListDB | MEDIUM |
 | `models.py` | Pydantic models, fail-closed validation (decision must match evidence) | MEDIUM |
@@ -156,7 +170,8 @@ proxy.py:
   extract_connip_ips(payload) → set[str]            # parse ConnIpRsp protobuf
   _ProxyBridge._connect_forward(ip) → socket        # route-lift: delete→connect→add
   _ProxyBridge._hot_add_route(ip) → bool            # add lo0 route for new IP
-  _ProxyBridge._handle_connection(sock)              # bidirectional proxy with frame parsing
+  _ProxyBridge._hot_add_login_redirect_ips(payload)  # parse LOGIN redirect protobuf, hot-add route
+  _ProxyBridge._handle_connection(sock)              # bidirectional proxy with frame parsing + passthrough
   _ProxyBridge.intercept_login() → ProxySession|None # full lifecycle
   obtain_authenticated_session(config) → ProxySession|None  # top-level entry
 
@@ -204,6 +219,9 @@ TARGET_SYMBOLS = ["1306", "1321", "1489"]
 | Packet replay | Token consumed server-side, always rejected |
 | lsof-only discovery | Too slow — TCP ESTABLISHED before route added |
 | Two-phase kill/restart | Poor UX, race conditions |
+| `_FrameStream` raise on non-FT data | Kills connection thread before sendall — breaks FTNN's TLS connections |
+| Treat LOGIN result≠0 as final failure | FTNN uses result=1 as redirect — needs retry on redirect server |
+| Regex IP extraction from LOGIN payload | Word boundary `\b` matches across protobuf field boundaries (e.g. "49.51.78.830") |
 
 ## stock-moni Integration
 
